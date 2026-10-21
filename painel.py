@@ -10,8 +10,9 @@ Como usar em qualquer computador:
         Abas: Visao geral (retorno em % do CDI, vol, spread, duration) | Fundo (alocacao, spread/duration por categoria,
         retorno x CDI com atribuicao, carteira, melhores ativos em retorno e em bps, mudancas na carteira) | Performance de
         ativos (todas as carteiras e meses: retorno, vol, Sharpe, fundos, % PL; clique = peso em cada fundo, spread, PU,
-        ANBIMA e ultimos negocios de balcao da B3) | Exposicoes vs. peers (papeis e grupos que os peers tem e nos nao) |
-        Novidades (quem abriu carteira/publicou CDA/atualizou cota desde a ultima vez) + fundos fora da lista com o mesmo credito.
+        ANBIMA) | Exposicoes vs. peers (papeis e grupos que os peers tem e nos nao).
+        Retorno do ativo = retorno total do mes (preco + juros/amortizacao pagos), comparavel ao CDI: debentures pelo PU par do SND,
+        FIDC pela rentabilidade oficial, CRI/CRA/NC sem fluxo publico pelo carrego (queda forte de preco fica marcada para conferir).
         So entra carteira publica: meses com menos de 5% confidencial (a CVM permite esconder por ate ~90 dias).
   Painel antigo no navegador (localhost):   python painel.py servidor
   Excel:   python painel.py excel
@@ -995,7 +996,7 @@ CAT_CORES = ["#2a78d6", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7", "#008300", "
 NOSSAS_CORES = ["#eb6834", "#c24f1d", "#f29a6b", "#a8401a", "#f5b38d"]
 GENERICO = (r"(?i)\b(FUNDO DE INVESTIMENTO|FUNDO|EM DIREITOS CREDIT[OÓ]RIOS|DE INVESTIMENTO|FIDC|FIC|FI|COTAS|MULTIMERCADO|"
             r"RENDA FIXA|CR[EÉ]DITO PRIVADO|RESPONSABILIDADE LIMITADA|RESP LTDA|N[AÃ]O PADRONIZADO|NP|LONGO PRAZO|LP)\b")
-METODO = 27                                     # suba quando mudar o calculo -> refaz o cache do dia
+METODO = 28                                     # suba quando mudar o calculo -> refaz o cache do dia
 CAIXA = ("Caixa",)
 CAIXA_CVM = ("Disponibilidades", "Operações Compromissadas", "Valores a receber", "Valores a pagar", lt.AJUSTE)
 TIPO_CASA = {"CDB/ RDB": "CDB", "CDB Vinculado": "CDB", "DPGE": "DPGE", "FI Imobiliário": "FII", "FI Participações": "FIP",
@@ -1662,6 +1663,8 @@ def detalhe(nome, cnpj, df, ctx, pl, rent):
                                                 codigo=("codigo", "first"), perc=("perc_pl", "sum"), sw=("sw", "sum"), sp_=("sp_", "sum"),
                                                 dw=("dw", "sum"), dp=("dp", "sum"), pu=("pu", "first"), fonte=("fonte", "first")).reset_index()
         t["spread"] = (t.sw / t.sp_).where(t.sp_ != 0)
+        t["pct_par"] = (t.pu / ctx.pu_par(m).reindex(t.codigo.fillna("").values).values * 100).where(t.categoria.isin(["DEB", "DEBIN"]))
+        t["pct_par"] = t.pct_par.where(t.pct_par.between(30, 130))
         t["duration"] = (t.dw / t.dp).where(t.dp != 0)
         tab_ativos.append(t.drop(columns=["sw", "sp_", "dw", "dp"]).assign(mes=m))
 
@@ -1684,6 +1687,16 @@ def detalhe(nome, cnpj, df, ctx, pl, rent):
             continue
         e0, gd0 = ricos[p]
         w = e0[e0.perc_pl.abs() > 0].copy()            # confidenciais entram (rendem CDI + residuo): a soma sempre fecha
+        conf_p, preench = float(w[w.casa.eq("Confidencial")].perc_pl.sum()), 0.0
+        if conf_p >= 5:                                 # carteira escondida: a parte confidencial vira a ultima carteira aberta (estimativa)
+            q = next((x for x in reversed(meses[:j]) if ricos[x][0][ricos[x][0].casa.eq("Confidencial")].perc_pl.sum() < 5), None)
+            if q is not None:
+                eq = ricos[q][0]
+                pub = eq[~eq.casa.isin(["Confidencial", *CAIXA]) & eq.perc_pl.gt(0)]
+                if len(pub):
+                    w = pd.concat([w[~w.casa.eq("Confidencial")], pub.assign(perc_pl=pub.perc_pl / pub.perc_pl.sum() * conf_p)],
+                                  ignore_index=True)
+                    preench = conf_p
         cdi_m = float(ctx.cdi_m.get(m, 0.0))
         # 1) retorno de cada ativo: esperado = CDI + spread proprio; usa a variacao real de preco quando ela e critica
         #    (queda maior que 1,5 p.p. abaixo do esperado = pagamento de cupom/amortizacao -> fica o esperado)
@@ -1707,12 +1720,21 @@ def detalhe(nome, cnpj, df, ctx, pl, rent):
         cods_w = w.codigo.fillna("").values
         pu0, pu1 = ctx.corrige(p, cods_w, nv.pu0.values), ctx.corrige(m, cods_w, nv.pu1.values)
         rp = rp.mask(np.isfinite(pu0) & np.isfinite(pu1), pu1 / pu0 - 1)                 # preco corrigido entre fundos
-        r = rp.where(rp.notna() & (rp >= esperado - 0.015) & (rp <= esperado + 0.03), esperado)
+        # CRI/CRA/NC/CCB pagam juros e amortizam todo mes e a CVM nao publica o fluxo: preco abaixo do esperado = pagamento
+        # (fica o carrego); so perda que persiste no mes seguinte (calote/remarcacao) entra como queda
+        amort = w.casa.isin(["CRI", "CRA", "NC", "CCB"]).values
+        piso = np.where(amort, esperado - 0.003, esperado - 0.015)
+        faixa = rp.notna() & (rp >= piso) & (rp <= esperado + 0.03)
+        r = rp.where(faixa, esperado)
+        src = np.where(faixa, "preço do fundo", "carrego + curva (sem preço)").astype(object)
         # queda forte so vale se persistir no mes seguinte (calote/remarcacao fica; erro de dado da CVM volta)
         m2 = meses[j + 1] if j + 1 < len(meses) else None
         pu2 = (ctx.corrige(m2, cods_w, nivel.loc[m2].pu1.reindex(w.chave.values).values)
                if m2 and len(preco) and m2 in nivel.index.get_level_values(0) else np.full(len(w), np.nan))
         persiste = lambda queda: np.isfinite(pu2) & (pu2 / pu0 - 1 < queda / 2)
+        perda = amort & np.isfinite(rp.values) & (rp.values < esperado.values - 0.10) & persiste(rp.values)   # queda > 10% que fica
+        r = r.mask(perda, rp)
+        src[perda] = "preço do fundo (perda que persiste)"
         exp_ = esperado.values
         deb = w.casa.isin(["DEB", "DEBIN"]).values
         if deb.any():
@@ -1722,6 +1744,7 @@ def detalhe(nome, cnpj, df, ctx, pl, rent):
             # preco ja corrigido entre fundos: marcacao a mercado entra direto; queda > 25% no mes so se persistir
             ok = np.isfinite(rt) & (rt < 0.3) & ((rt > -0.25) | ((rt > -0.8) & persiste(rt)))
             r = r.mask(ok, rt)
+            src[np.asarray(ok)] = "preço + pagamento (SND)"
         # titulos publicos: preco do Tesouro + cupom semestral no mes de pagamento (NTN-B 6% a.a., NTN-F 10% a.a.)
         tpm = w.casa.eq("Títulos Públicos").values & np.isfinite(pu0) & np.isfinite(pu1)
         if tpm.any():
@@ -1730,21 +1753,29 @@ def detalhe(nome, cnpj, df, ctx, pl, rent):
             cup = np.where((w.tp.values == "NTN-B") & ((mm == mv) | (mm == (mv + 5) % 12 + 1)), 1.06 ** 0.5 - 1,
                            np.where((w.tp.values == "NTN-F") & np.isin(mm, [1, 7]), 1.10 ** 0.5 - 1, 0.0))
             rtp = (pu1 * (1 + 0) + pu0 * cup) / pu0 - 1
-            r = r.mask(tpm & np.isfinite(rtp) & (rtp > -0.2) & (rtp < 0.2), rtp)
+            okt = tpm & np.isfinite(rtp) & (rtp > -0.2) & (rtp < 0.2)
+            r = r.mask(okt, rtp)
+            src[np.asarray(okt)] = "Tesouro + cupom"
         fid = w.casa.eq("FIDC").values
         if fid.any():
             rf = np.full(len(w), np.nan)
             rf[fid] = [ctx.fidc_ret(c, m, pu) for c, pu in zip(w.codigo.fillna("").values[fid], w.pu.values[fid].astype(float))]
-            r = r.mask(np.isfinite(rf) & (rf > -0.8) & (rf < 0.3), rf)          # retorno oficial da serie (cota + amortizacao)
+            okf = np.isfinite(rf) & (rf > -0.8) & (rf < 0.3)
+            r = r.mask(okf, rf)          # retorno oficial da serie (cota + amortizacao)
+            src[okf] = "FIDC: rentabilidade oficial (CVM)"
         # renda variavel (acoes, FII, FIAGRO, ETF, FIP): preco de mercado sem filtro; FII/FIAGRO + dividendo estimado
         usd_r = w.casa.isin(USD).values & np.isfinite(rp.values) & (rp.values > -0.1) & (rp.values < 0.1)   # > 10% no mes = erro de unidade
         r = r.mask(usd_r, rp.values)                     # em dolar: preco real em reais; o futuro de dolar compensa o cambio
+        src[usd_r] = "preço em R$"
         rv = w.casa.isin(SEM_SPREAD).values & ~w.casa.eq("Confidencial").values & np.isfinite(rp.values)
         if rv.any():
             div = np.where(w.casa.isin(["FII", "FIAGRO"]).values, 0.75 * cdi_m, 0.0)
-            r = r.mask(rv & (rp.values > -0.6) & (rp.values < 0.6), rp.values + div)
+            okv = rv & (rp.values > -0.6) & (rp.values < 0.6)
+            r = r.mask(okv, rp.values + div)
+            src[okv] = "preço de mercado"
         cx = w.casa.isin(CAIXA)
         r[cx] = cdi_m
+        src[cx.values] = "CDI"
         if CAPTURA is not None:
             CAPTURA[(nome, m, "retorno")] = w.assign(r_=np.asarray(r, float), rp_=rp.values, pu0_=pu0, pu1_=pu1, esp_=esperado.values)
         ativo_c = w.perc_pl * r
@@ -1778,7 +1809,7 @@ def detalhe(nome, cnpj, df, ctx, pl, rent):
             cr = w.perc_pl.gt(0)
         ativo_c[cr] += resid * w.perc_pl[cr] / w.perc_pl[cr].sum()
         atr_meses.append({"mes": m, "real": float(real[m]) * 100, "cdi": float(ctx.cdi_m.get(m, np.nan)) * 100,
-                          "hedge": hedge, "resid": resid, "taxas": tx})
+                          "hedge": hedge, "resid": resid, "taxas": tx, "preench": preench})
         jm = len(atr_meses) - 1
         por_cat = ativo_c.groupby(w.casa).sum()
         if tx:
@@ -1788,12 +1819,14 @@ def detalhe(nome, cnpj, df, ctx, pl, rent):
             cats_atr.setdefault(c, {"contrib": [None] * jm, "peso": [None] * jm})
             cats_atr[c]["contrib"].append(float(por_cat.get(c, 0.0)))
             cats_atr[c]["peso"].append(float(peso.get(c, 0.0)))
-        nc = w[~cx & ~w.casa.eq("Confidencial")].assign(c_=ativo_c[~cx & ~w.casa.eq("Confidencial")])                               # caixa/compromissada fora do ranking
-        pa = nc.groupby(["rotulo", "casa"]).agg(v=("c_", "sum"), p=("perc_pl", "sum"), gr=("grupo", "first"),
-                                                cod=("codigo", "first"), em=("emissor", "first"))
+        sel_ = (~cx & ~w.casa.eq("Confidencial")).values
+        nc = w[sel_].assign(c_=ativo_c[sel_], rw_=np.asarray(r, float)[sel_] * w.perc_pl.values[sel_], src_=src[sel_])   # caixa fora do ranking
+        pa = nc.groupby(["rotulo", "casa"]).agg(v=("c_", "sum"), p=("perc_pl", "sum"), rw=("rw_", "sum"), src=("src_", "first"),
+                                                gr=("grupo", "first"), cod=("codigo", "first"), em=("emissor", "first"))
         for (a, c), x in pa.iterrows():
             if abs(x.v) > 1e-5:
-                contrib.append([id_ativo(a, c, x.gr, x.cod, x.em), jm, round(float(x.v), 6), round(float(x.p), 4)])
+                contrib.append([id_ativo(a, c, x.gr, x.cod, x.em), jm, round(float(x.v), 6), round(float(x.p), 4),
+                                round(float(x.rw / x.p) * 100, 4) if x.p > 0 else None, x.src])
     for c in cats_atr.values():
         for key in ("contrib", "peso"):
             c[key] += [None] * (len(atr_meses) - len(c[key]))
@@ -1893,7 +1926,8 @@ LIMITE_CONF = 5.0                          # % do PL confidencial acima do qual 
 MESES_ATIVOS = 3                           # meses abertos com a lista de ativos no HTML (por fundo)
 FORA_PERF = {"Caixa", "Títulos Públicos", "Ajuste", "Confidencial", "Taxas do fundo", lt.AJUSTE}
 N_DETALHE = 1800                           # ativos com historico completo no HTML (clique)
-DIAS_B3 = 10                               # pregoes de negocios de balcao da B3 (ultimos negocios de cada ativo)
+SRC = {"preço + pagamento (SND)": "S", "preço do fundo": "P", "carrego + curva (sem preço)": "E", "FIDC: rentabilidade oficial (CVM)": "F",
+       "Tesouro + cupom": "T", "preço em R$": "U", "preço de mercado": "M", "preço do fundo (perda que persiste)": "L", "CDI": "C"}
 
 
 def _r(x, n=2):
@@ -1916,72 +1950,6 @@ def _ret_mensal(datas, serie):
         return {}
     m = s.groupby(s.index.to_period("M")).last()
     return {str(p): float(v) for p, v in (m / m.shift(1) - 1).dropna().items()}
-
-
-def _b3_negocios(log):
-    """Negocios de balcao da B3 (BDI 'Trade') dos ultimos DIAS_B3 pregoes, com cache por dia."""
-    pasta = lt.CACHE / "b3_negocios"
-    pasta.mkdir(exist_ok=True)
-    cols = ["tipo", "emissor", "codigo", "quantidade", "pu", "volume", "taxa", "origem", "hora", "data"]
-    out = []
-    for dia in pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=DIAS_B3 + 2)[::-1]:
-        f = pasta / f"{dia:%Y%m%d}.parquet"
-        if f.exists() and dia < pd.Timestamp.today().normalize():
-            x = pd.read_parquet(f)
-        else:
-            try:
-                r = requests.post("https://arquivos.b3.com.br/bdi/table/export/csv?lang=pt-BR", timeout=120,
-                                  json={"Name": "Trade", "Date": f"{dia:%Y-%m-%d}", "FinalDate": f"{dia:%Y-%m-%d}", "ClientId": "", "Filters": {}})
-                t = r.content.decode("utf-8-sig").splitlines()
-                i = next((k for k, l in enumerate(t) if l.count(";") > 5), None)
-                x = pd.DataFrame(columns=cols) if i is None else pd.read_csv(io.StringIO("\n".join(t[i:])), sep=";", dtype=str)
-                if len(x):
-                    x = x.iloc[:, :14]
-                    x.columns = cols + ["id", "isin", "liquidacao", "situacao"]
-                    x = x[x.situacao.ne("Cancelado")][cols]
-                    for c in ("quantidade", "pu", "volume", "taxa"):
-                        x[c] = pd.to_numeric(x[c].str.replace(".", "", regex=False).str.replace(",", ".", regex=False), errors="coerce")
-                    x["data"] = f"{dia:%Y-%m-%d}"
-                x.to_parquet(f)
-            except Exception as e:
-                log(f"   B3 negócios {dia:%d/%m}: indisponível ({type(e).__name__})")
-                continue
-        if len(x):
-            out.append(x)
-        if len(out) >= DIAS_B3:
-            break
-    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=cols)
-
-
-def _candidatos(universo_cod, ja, log):
-    """Fundos fora das listas que carregam os mesmos papeis que nossos fundos e os peers (mes mais recente com a CDA inteira)."""
-    import zipfile
-    for z_ in reversed(sorted(lt.CACHE.glob("cda_fi_2*.zip"))[-4:]):
-        try:
-            z = zipfile.ZipFile(z_)
-            nomes = z.namelist()
-            if not any("_PL_" in n for n in nomes):
-                continue
-            cols = {"CNPJ_FUNDO_CLASSE", "CNPJ_FUNDO", "DENOM_SOCIAL", "TP_APLIC", "VL_MERC_POS_FINAL", "CD_ATIVO", "DT_COMPTC"}
-            b = pd.concat([lt.le(z, n, cols) for n in nomes if any(k in n for k in ("_BLC_4_", "_BLC_5_", "_BLC_6_"))], ignore_index=True)
-            pl = lt.le(z, next(n for n in nomes if "_PL_" in n), {"CNPJ_FUNDO_CLASSE", "CNPJ_FUNDO", "DENOM_SOCIAL", "VL_PATRIM_LIQ"})
-            break
-        except Exception as e:                                              # zip incompleto (CVM publicando): tenta o anterior
-            log(f"   candidatos: {z_.name} ilegível ({type(e).__name__})")
-    else:
-        return [], None
-    mes = str(b.DT_COMPTC.dropna().iloc[0])[:7] if b.DT_COMPTC.notna().any() else z_.stem[-6:]
-    b["v"] = pd.to_numeric(b.VL_MERC_POS_FINAL, errors="coerce").fillna(0)
-    b = b[b.TP_APLIC.fillna("").str.contains(r"(?i)deb[eê]ntur|cr[eé]dito privado|dep[oó]sitos a prazo|t[ií]tulos de cr[eé]dito|agroneg|imobili")]
-    comum = b.CD_ATIVO.fillna("").str.strip().str.upper().isin(universo_cod)    # mesmo papel; emissor generico (bancos) inflava
-    g = b.assign(comum=b.v.where(comum, 0)).groupby("CNPJ_FUNDO_CLASSE").agg(credito=("v", "sum"), comum=("comum", "sum"), nome=("DENOM_SOCIAL", "first"))
-    p = pl.drop_duplicates("CNPJ_FUNDO_CLASSE").set_index("CNPJ_FUNDO_CLASSE")
-    g = g.join(pd.to_numeric(p.VL_PATRIM_LIQ, errors="coerce").rename("pl"))
-    g = g[(g.pl >= 3e8) & ~g.index.isin(ja)]
-    g["pct_credito"], g["pct_comum"] = g.credito / g.pl * 100, g.comum / g.pl * 100
-    g = g[(g.pct_credito >= 50) & (g.pct_comum >= 10)].sort_values("pct_comum", ascending=False).head(30)
-    return [{"cnpj": c, "nome": r.nome, "pl": _r(r.pl / 1e6, 0), "pct_credito": _r(r.pct_credito, 1), "pct_comum": _r(r.pct_comum, 1)}
-            for c, r in g.iterrows()], mes
 
 
 def _metricas(r, cdi):
@@ -2022,11 +1990,12 @@ def exporta_html(pasta=None, saida=None, log=print):
         ret = (F or {}).get("retorno", {})
         meses_ret = [m["mes"] for m in ret.get("meses", [])]
         lista = ret.get("ativos", [])
-        for i_a, jm, v, p in ret.get("contrib", []):                       # contribuicao (pp do PL) e peso (% PL) por ativo e mes
+        for c_ in ret.get("contrib", []):          # [ativo, mes, contribuicao (pp do PL), peso (% PL), retorno do ativo (%), fonte]
+            i_a, jm, v, p = c_[:4]
             a = lista[i_a] if i_a < len(lista) else None
             if a and a.get("categoria") not in FORA_PERF and jm < len(meses_ret):
                 contrib.append((f["id"], _chave(a.get("codigo"), a.get("ativo")), a.get("ativo"), a.get("categoria"), a.get("grupo") or "",
-                                a.get("emissor") or "", meses_ret[jm], v, p))
+                                a.get("emissor") or "", meses_ret[jm], v, p, c_[4] if len(c_) > 4 else None, SRC.get(c_[5], "?") if len(c_) > 5 else "?"))
         cota = f.get("cota", [])
         rm = _ret_mensal(V["datas"], cota) if cota else {}
         ult_cota = next((V["datas"][i] for i in range(len(cota) - 1, -1, -1) if cota[i] is not None), None) if cota else None
@@ -2039,7 +2008,7 @@ def exporta_html(pasta=None, saida=None, log=print):
             t = pd.read_parquet(ja)
             t = t[~t.categoria.isin(["Confidencial"]) & (t.perc.abs() >= .005)]
             t = t.assign(chave=[_chave(c, r) for c, r in zip(t.codigo, t.rotulo)], id=f["id"])
-            pos.append(t[["id", "mes", "chave", "rotulo", "categoria", "grupo", "emissor", "perc", "pu", "spread", "duration"]])
+            pos.append(t.reindex(columns=["id", "mes", "chave", "rotulo", "categoria", "grupo", "emissor", "perc", "pct_par", "spread", "duration"]))
             pls = {c["m"]: c["pl"] for c in carteira}
             for r in t[t.mes.isin(abertos[-MESES_ATIVOS:])].itertuples():
                 ativos.append([f["id"], r.mes, r.chave, str(r.rotulo), r.categoria, str(r.grupo or ""), str(r.emissor or ""),
@@ -2050,7 +2019,7 @@ def exporta_html(pasta=None, saida=None, log=print):
     P = pd.concat(pos, ignore_index=True) if pos else pd.DataFrame(columns=["id", "mes", "chave", "rotulo", "categoria", "grupo", "emissor", "perc"])
     P = P.groupby(["id", "mes", "chave"], as_index=False).agg(rotulo=("rotulo", "first"), categoria=("categoria", "first"),
                                                               grupo=("grupo", "first"), emissor=("emissor", "first"), perc=("perc", "sum"),
-                                                              pu=("pu", "median"), spread=("spread", "median"), duration=("duration", "median"))
+                                                              pct_par=("pct_par", "median"), spread=("spread", "median"), duration=("duration", "median"))
     P["nosso"] = P.id.map(nosso)
     P["rs"] = [(p or 0) / 100 * (pls_mes.get((i, m)) or 0) for i, m, p in zip(P.id, P.mes, P.perc)]
     U = P[[ult.get(i) == m for i, m in zip(P.id, P.mes)] & ~P.categoria.isin(FORA_PERF)]     # ultima carteira aberta de cada fundo
@@ -2070,20 +2039,36 @@ def exporta_html(pasta=None, saida=None, log=print):
     meses = sorted(m for m in cdi_m if m <= ult_completo and m >= lt.DESDE)
     mi = {m: i for i, m in enumerate(meses)}
     cdi_v = np.array([cdi_m[m] * 100 for m in meses])
-    C = pd.DataFrame(contrib, columns=["id", "chave", "rotulo", "categoria", "grupo", "emissor", "mes", "v", "p"])
-    C = C[C.mes.isin(mi) & (C.p > 0.01)]
-    agg = C.groupby(["chave", "mes"]).agg(v=("v", "sum"), p=("p", "sum")).reset_index()
-    agg["r"] = agg.v / agg.p * 100                                         # % no mes (media ponderada pelos fundos)
+    C = pd.DataFrame(contrib, columns=["id", "chave", "rotulo", "categoria", "grupo", "emissor", "mes", "v", "p", "r", "src"])
+    C = C[C.mes.isin(mi) & (C.p > 0.01) & C.r.notna()]
+    # retorno do ativo no mes = retorno total do proprio ativo (preco + pagamentos; sem hedge/residuo do fundo), medio ponderado entre fundos
+    agg = C.assign(rp=C.r * C.p).sort_values("p").groupby(["chave", "mes"]).agg(rp=("rp", "sum"), p=("p", "sum"), src=("src", "last")).reset_index()
+    agg["r"] = agg.rp / agg.p
+    # CRI/CRA/NC/CCB: queda grande de preco que fica pode ser amortizacao ou perda (fluxo nao publico): no retorno fica o carrego
+    # (CDI + spread do papel) e o mes e marcado "A" com a queda observada, para o usuario conferir
+    sp_m = P.groupby(["chave", "mes"]).spread.median()
+    ev = agg.src.eq("L")
+    agg["queda"] = agg.r.where(ev)
+    car = [((1 + cdi_m.get(m, 0)) * (1 + (sp_m.get((c, m), np.nan) if np.isfinite(sp_m.get((c, m), np.nan)) else 2.0) / 100) ** (1 / 12) - 1) * 100
+           for c, m in zip(agg.chave[ev], agg.mes[ev])]
+    agg.loc[ev, "r"] = car
+    agg.loc[ev, "src"] = "A"
     agg = agg[agg.r.between(-60, 60)]
     info = C.groupby("chave").agg(rotulo=("rotulo", "last"), categoria=("categoria", "last"), grupo=("grupo", "last"),
                                   emissor=("emissor", "last"), n_ever=("id", "nunique"))
     ult_pos = U.groupby("chave").agg(n_hoje=("id", "nunique"), perc_med=("perc", "mean"), rs=("rs", "sum"),
                                      spread=("spread", "median"), duration=("duration", "median"),
                                      nossos=("nosso", "sum"))
-    perf, series = [], {}
+    perf, series, fontes, eventos = [], {}, {}, {}
     for ch, g in agg.groupby("chave"):
+        if g.queda.notna().any():
+            eventos[ch] = {mi[m]: _r(q) for m, q in zip(g.mes, g.queda) if np.isfinite(q)}
         r = np.full(len(meses), np.nan)
         r[[mi[m] for m in g.mes]] = g.r.values
+        fs = [" "] * len(meses)
+        for m_, s_ in zip(g.mes, g.src):
+            fs[mi[m_]] = s_
+        fontes[ch] = "".join(fs)
         if np.isfinite(r).sum() < 3:
             continue
         i0 = info.loc[ch]
@@ -2098,78 +2083,46 @@ def exporta_html(pasta=None, saida=None, log=print):
                      "duration": _r(u.duration) if u is not None else None, "temos": ch in temos})
         series[ch] = r
     perf.sort(key=lambda x: -(x["n_ever"] * (x["wt"][4] or 0)))
-    det_ch = {p["chave"] for p in perf[:N_DETALHE]} | {o["chave"] for o in sorted(overlap, key=lambda o: -o["n"])[:500]}
+    det_ch = ({a[2] for a in ativos} | {p["chave"] for p in perf[:N_DETALHE]}       # todo ativo de carteira aberta + os mais relevantes
+              | {o["chave"] for o in sorted(overlap, key=lambda o: -o["n"])[:500]})
     # historico do clique: retorno mensal, % PL em cada fundo, spread e PU informados pelos fundos, ANBIMA, ultimos negocios B3
-    Pd = P[P.chave.isin(det_ch) & P.mes.isin(mi)]
+    Pd = P[P.chave.isin(det_ch) & P.mes.isin(set(meses[-36:]))]          # % PL e spread: ultimos 36 meses
     pl_hist = {ch: {fid: [[mi[m], _r(p, 3)] for m, p in zip(gg.mes, gg.perc)] for fid, gg in g.groupby("id")} for ch, g in Pd.groupby("chave")}
-    med = Pd.groupby(["chave", "mes"]).agg(sp=("spread", "median"), pu=("pu", "median"), du=("duration", "median")).reset_index()
-    med_h = {ch: {"m": [mi[m] for m in g.mes], "sp": [_r(x) for x in g.sp], "pu": [_r(x, 2) for x in g.pu], "du": [_r(x) for x in g.du]}
+    med = Pd.groupby(["chave", "mes"]).agg(sp=("spread", "median"), par=("pct_par", "median"), du=("duration", "median")).reset_index()
+    med_h = {ch: {"m": [mi[m] for m in g.mes], "sp": [_r(x) for x in g.sp], "par": [_r(x, 2) for x in g.par], "du": [_r(x) for x in g.du]}
              for ch, g in med.groupby("chave")}
     try:
         _, an = lt.anbima_debentures()
         an = an[an.codigo.str.strip().str.upper().isin(det_ch)] if len(an) else an
+        tipo_tx = {"DI +": "CDI+ (%)", "% do DI": "% do CDI", "IPCA +": "IPCA+ (%)", "IGP-M +": "IGP-M+ (%)", "Outros": "pré (%)"}
         anb = {ch: {"d": g.data.dt.strftime("%Y-%m-%d").tolist(), "tx": [_r(x, 4) for x in g.taxa_ind], "par": [_r(x, 3) for x in g.pct_par],
-                    "ind": str(g.indice.iloc[-1])} for ch, g in an.sort_values("data").groupby(an.codigo.str.strip().str.upper())} if len(an) else {}
+                    "ind": tipo_tx.get(str(g.tipo.iloc[-1]), str(g.indice.iloc[-1]))}
+               for ch, g in an.sort_values("data").groupby(an.codigo.str.strip().str.upper())} if len(an) else {}
     except Exception as e:
         log(f"   ANBIMA: sem histórico ({type(e).__name__})")
         anb = {}
-    try:
-        b3 = _b3_negocios(log)
-        b3 = b3[b3.codigo.str.strip().str.upper().isin(det_ch)].sort_values(["data", "hora"], ascending=False)
-        neg = {ch: [[d, h, _r(t, 4), _r(p, 4), _r(v / 1e6, 3)] for d, h, t, p, v in zip(g.data, g.hora, g.taxa, g.pu, g.volume)][:12]
-               for ch, g in b3.groupby(b3.codigo.str.strip().str.upper())}
-    except Exception as e:
-        log(f"   B3: sem negócios ({type(e).__name__})")
-        neg = {}
-    det = {ch: {"r": [_r(x) for x in series[ch]] if ch in series else None, "pl": pl_hist.get(ch, {}), "h": med_h.get(ch),
-                "anb": anb.get(ch), "neg": neg.get(ch)} for ch in det_ch}
+    det = {ch: {"r": [_r(x, 3) for x in series[ch]] if ch in series else None, "s": fontes.get(ch), "ev": eventos.get(ch), "pl": pl_hist.get(ch, {}),
+                "h": med_h.get(ch), "anb": anb.get(ch)} for ch in det_ch}
     # ---------------- melhores ativos de cada fundo (12 meses): retorno e contribuicao em bps
     f_top = {}
     m12 = set(meses[-12:])
     for fid, g in C[C.mes.isin(m12)].groupby("id"):
         x = g.groupby("chave").agg(rotulo=("rotulo", "last"), categoria=("categoria", "last"), v=("v", "sum"), p=("p", "mean"), n=("mes", "nunique"))
-        rr = g.assign(r=g.v / g.p).groupby("chave").r.apply(lambda s: (np.prod(1 + s.clip(-.6, .6)) - 1) * 100)
+        g = g.assign(r=g.r.where(g.src.ne("L"), np.nan))
+        g = g.assign(r=g.r.fillna(g.chave.map(lambda c: np.nan)).fillna(g.mes.map(lambda m: ((1 + cdi_m.get(m, 0)) * 1.02 ** (1 / 12) - 1) * 100)))
+        rr = g.groupby("chave").r.apply(lambda s: (np.prod(1 + (s / 100).clip(-.6, .6)) - 1) * 100)      # retorno total do ativo, 12m
         x = x.join(rr.rename("ret"))
         x = x.loc[x.v.abs().sort_values(ascending=False).index[:60].union(x.ret.sort_values(ascending=False).index[:40])]
         f_top[fid] = [[ch, r.rotulo, r.categoria, _r(r.ret), _r(r.v * 100, 1), _r(r.p), int(r.n)] for ch, r in x.iterrows()]
-    # ---------------- novidades desde a ultima vez que o HTML foi gerado
-    estado_f = saida.with_suffix(".estado.json")
-    antes = json.loads(estado_f.read_text(encoding="utf-8")) if estado_f.exists() else {}
-    agora = {f["id"]: {"aberto": f["abertos"][-1] if f["abertos"] else None,
-                       "carteira": f["carteira"][-1]["m"] if f["carteira"] else None, "cota": f["ult_cota"]} for f in fundos}
-    novidades = []
-    for f in fundos if antes else []:
-        a, b = antes.get(f["id"], {}), agora[f["id"]]
-        if not a:
-            novidades.append({"id": f["id"], "o_que": "fundo novo na lista"})
-            continue
-        if b["aberto"] and b["aberto"] != a.get("aberto"):
-            novidades.append({"id": f["id"], "o_que": f"abriu a carteira de {b['aberto']} (antes: {a.get('aberto') or '—'})"})
-        if b["carteira"] and b["carteira"] != a.get("carteira"):
-            novidades.append({"id": f["id"], "o_que": f"publicou a CDA de {b['carteira']}"})
-        if b["cota"] and b["cota"] != a.get("cota"):
-            novidades.append({"id": f["id"], "o_que": f"cota até {b['cota']}"})
-    try:
-        ja = {lt.cnpj_of(c) for c in list(lt.NOSSOS_FUNDOS.values()) + list(lt.PEERS.values())}
-        for fp in pasta.glob("*.parquet"):                                  # veiculos (masters/FICs) dos fundos ja acompanhados
-            if not fp.stem.endswith("_ativos"):
-                try:
-                    ja |= set(pd.read_parquet(fp, columns=["cnpj_veiculo"]).cnpj_veiculo.dropna().unique())
-                except Exception:
-                    pass
-        cand, mes_cand = _candidatos(set(U.chave), ja, log)
-    except Exception as e:
-        log(f"   candidatos: não calculado ({type(e).__name__}: {e})")
-        cand, mes_cand = [], None
     dados = {"gerado": pd.Timestamp.now().strftime("%d/%m/%Y %H:%M"), "cdi": {k: _r(v * 100, 3) for k, v in cdi_m.items()},
              "ult_mes_completo": ult_completo, "meses": meses, "fundos": fundos, "ativos": ativos, "overlap": overlap, "grupos": grupos,
-             "perf": perf, "det": det, "f_top": f_top, "novidades": novidades, "primeira_vez": not antes, "candidatos": cand,
-             "mes_candidatos": mes_cand, "limite_conf": LIMITE_CONF, "anb_ini": min((v["d"][0] for v in anb.values()), default=None)}
+             "perf": perf, "det": det, "f_top": f_top, "limite_conf": LIMITE_CONF, "anb_ini": min((v["d"][0] for v in anb.values()), default=None),
+             "preench": {f["id"]: [m["mes"] for m in json.loads((pasta / (f["id"] + ".json")).read_text(encoding="utf-8"))["retorno"]["meses"]
+                                   if m.get("preench")] for f in fundos if (pasta / (f["id"] + ".json")).exists()}}
     pagina = PAGINA_HTML.replace("/*PLOTLY*/", _plotly_js()).replace("/*DADOS*/", json.dumps(limpo(dados), ensure_ascii=False))
     saida.write_text(pagina, encoding="utf-8")
-    estado_f.write_text(json.dumps(agora), encoding="utf-8")
     log(f"HTML: {saida} ({saida.stat().st_size / 1e6:.1f} MB; {len(fundos)} fundos, {len(perf)} ativos com desempenho, "
-        f"{len(det)} com histórico, {sum(1 for v in det.values() if v['neg'])} com negócios B3, {len(novidades)} novidades, {len(cand)} candidatos)")
+        f"{len(det)} com histórico)")
     return saida
 
 
@@ -2214,7 +2167,7 @@ details.ms .op{position:absolute;z-index:9;background:#fff;border:1px solid var(
 details.ms label{display:block;padding:2px 0;white-space:nowrap}.mini{font-size:11px;color:var(--s);margin:4px 0 0}
 </style></head><body>
 <header><div><h1>Painel de Fundos — nossos × peers</h1><div class="s" id="hsub"></div></div>
-<div class="s">Só dado público: carteira (CDA/CVM) nos meses com menos de <b id="hlim"></b>% confidencial • retorno pela cota diária da CVM • ANBIMA e negócios de balcão da B3</div></header>
+<div class="s">Só dado público: carteira (CDA/CVM) nos meses com menos de <b id="hlim"></b>% confidencial • retorno pela cota diária da CVM • ANBIMA • SND</div></header>
 <nav id="nav"></nav>
 <main>
 <section class="aba" id="a_geral">
@@ -2228,10 +2181,10 @@ details.ms label{display:block;padding:2px 0;white-space:nowrap}.mini{font-size:
   <div class="kpis" id="f_kpis"></div>
   <div class="cx"><h2>Alocação por categoria (% do PL) — só meses abertos</h2><div id="f_aloc" style="height:360px"></div></div>
   <div class="cx"><h2>Spread CDI+ e duration da carteira</h2><div class="ctl"><details class="ms" id="f_sdcat"><summary>Categorias ▾</summary><div class="op"></div></details>
-    <span class="sub">Linha cheia = spread CDI+ (eixo esquerdo, % a.a.) • tracejada = duration (eixo direito, anos)</span></div><div id="f_sd" style="height:360px"></div></div>
-  <div class="cx"><h2>Retorno mensal × CDI e de onde veio (por categoria)</h2><div class="sub">Atribuição estimada: carrego + variação de taxa por ativo; resíduo distribuído pelo peso • passe o mouse nas barras</div><div id="f_ret" style="height:380px"></div></div>
+    <span class="sub">Spread CDI+: linhas cheias, eixo esquerdo (% a.a.) • duration: linhas tracejadas em outra cor, eixo direito (anos)</span></div><div id="f_sd" style="height:360px"></div></div>
+  <div class="cx"><h2>Retorno mensal × CDI e de onde veio (por categoria)</h2><div class="sub">Atribuição estimada: retorno de cada ativo × peso; hedges e resíduo distribuídos pelo peso • meses com a carteira escondida (confidencial) usam a última carteira aberta e ficam marcados com * • passe o mouse nas barras</div><div id="f_ret" style="height:380px"></div></div>
   <div class="cx"><h2>Carteira</h2><div class="ctl"><select id="f_mes"></select><select id="f_cat"></select><input id="f_busca" placeholder="buscar ativo/emissor"></div><div class="scroll"><table class="t" id="f_tab"></table></div></div>
-  <div class="cx"><h2>Melhores ativos do fundo — últimos 12 meses</h2><div class="ctl"><span class="chip on" data-m="ret">Retorno do ativo</span><span class="chip" data-m="bps">Contribuição para o fundo (bps)</span><span class="sub">clique no ativo para ver o histórico</span></div><div class="scroll"><table class="t" id="f_top"></table></div></div>
+  <div class="cx"><h2>Melhores ativos do fundo — últimos 12 meses</h2><div class="ctl"><span class="chip on" data-m="ret">Retorno do ativo</span><span class="chip" data-m="bps">Contribuição para o fundo (bps)</span><select id="f_topcat"></select><span class="sub">clique no título da coluna para ordenar (de novo inverte) • clique no ativo para o histórico</span></div><div class="scroll"><table class="t" id="f_top"></table></div></div>
   <div class="cx"><h2>Mudanças na carteira</h2><div class="sub" id="f_mud_sub"></div><div class="g2"><div><b>Entradas e aumentos</b><table class="t" id="f_mud_up"></table></div><div><b>Saídas e reduções</b><table class="t" id="f_mud_dn"></table></div></div></div>
 </section>
 <section class="aba" id="a_perf">
@@ -2247,10 +2200,7 @@ details.ms label{display:block;padding:2px 0;white-space:nowrap}.mini{font-size:
   <div class="cx"><h2>Exposições dos peers ausentes nas nossas carteiras</h2><div class="sub">Última carteira aberta de cada fundo • % PL médio entre os peers que têm • R$ somado nos peers • "Nosso % no grupo" = % do PL médio dos nossos fundos no mesmo grupo econômico (podemos ter outra emissão do emissor) • sem caixa e títulos públicos • clique para o histórico</div><div class="scroll"><table class="t" id="p_tab"></table></div></div>
   <div class="cx"><h2>Grupos econômicos: peso médio dos peers × nosso</h2><div class="sub">% do PL somado por grupo, médio por fundo • diferença positiva = peers mais expostos que nós</div><div class="scroll"><table class="t" id="p_gru"></table></div></div>
 </section>
-<section class="aba" id="a_novo">
-  <div class="cx"><h2>Novidades desde a última atualização</h2><div id="n_lista"></div></div>
-  <div class="cx"><h2>Fundos fora da lista com o mesmo crédito</h2><div class="sub" id="n_sub"></div><div class="scroll"><table class="t" id="n_cand"></table></div></div>
-</section>
+
 </main>
 <script>/*PLOTLY*/</script>
 <script>
@@ -2270,7 +2220,7 @@ const LAYR=x=>LAY(Object.assign({margin:{l:56,r:170,t:10,b:40},legend:{x:1.02,y:
 const plot=(id,d,l)=>Plotly.newPlot(id,d,l,{displayModeBar:false,responsive:true});
 const cls=v=>v==null?"":v>=0?"pos":"neg";
 $("#hsub").textContent=`Gerado em ${D.gerado} • ${D.fundos.length} fundos (${D.fundos.filter(f=>f.nosso).length} nossos) • retorno até ${mesBR(D.ult_mes_completo)}`;$("#hlim").textContent=D.limite_conf;
-const ABAS=[["a_geral","Visão geral"],["a_fundo","Fundo"],["a_perf","Performance de ativos"],["a_peers","Exposições vs. peers"],["a_novo",`Novidades${D.novidades.length?" ("+D.novidades.length+")":""}`]];
+const ABAS=[["a_geral","Visão geral"],["a_fundo","Fundo"],["a_perf","Performance de ativos"],["a_peers","Exposições vs. peers"]];
 $("#nav").innerHTML=ABAS.map(a=>`<a data-a="${a[0]}">${a[1]}</a>`).join("");
 const vai=a=>{document.querySelectorAll("nav a").forEach(x=>x.classList.toggle("on",x.dataset.a==a));document.querySelectorAll(".aba").forEach(x=>x.classList.toggle("on",x.id==a));history.replaceState(null,"","#"+a);window.dispatchEvent(new Event("resize"))};
 document.querySelectorAll("nav a").forEach(x=>x.onclick=()=>vai(x.dataset.a));
@@ -2309,38 +2259,55 @@ function geral(){const b=$("#g_busca").value.toLowerCase();
     marker:{color:n?"#eb6834":"#9aa0a6",size:n?12:9,line:{color:"#fff",width:1}},hovertemplate:"%{text}<br>CDI+ %{y:.2f}%<br>duration %{x:.2f}<extra></extra>"}}),LAY({xaxis:{title:{text:"duration (anos)"}},yaxis:{title:{text:"spread CDI+ (% a.a.)"}}}))}
 // ---------- detalhe de um ativo (clique em qualquer tabela de ativos)
 let detN=0;
-function detalheAtivo(tr,ch,ncol){const prox=tr.nextElementSibling;if(prox&&prox.classList.contains("det")){prox.remove();return}
+const FONTE={S:"preço do fundo + juros/amortização pagos (PU par do SND)",P:"preço informado pelo fundo",E:"carrego + curva (sem preço observável no mês)",
+ F:"FIDC: rentabilidade oficial da série (CVM)",T:"Tesouro + cupom",U:"preço em R$ (sem hedge)",M:"preço de mercado",C:"CDI",
+ A:"carrego (CDI + spread): o preço caiu forte — amortização ou perda? o fluxo deste papel não é público, confira"};
+function detalheAtivo(tr,ch,ncol,ctx){const prox=tr.nextElementSibling;if(prox&&prox.classList.contains("det")){prox.remove();return}
   document.querySelectorAll("tr.det").forEach(x=>x.remove());const d=D.det[ch],p=PERF[ch]||{},o=OVL[ch]||{},id="dt"+(++detN);
   const n=document.createElement("tr");n.className="det";tr.after(n);
-  if(!d){n.innerHTML=`<td colspan="${ncol}">Sem histórico detalhado para este ativo no arquivo (fica só para os ${Object.keys(D.det).length} mais negociados/relevantes).</td>`;return}
+  if(!d){n.innerHTML=`<td colspan="${ncol}">Sem histórico detalhado para este ativo no arquivo (fica só para os ${Object.keys(D.det).length} mais relevantes).</td>`;return}
   const w=p.w12||[],u3=p.ult3||[];
   const k=[["Último mês",u3[2]==null?"—":br(u3[2])+"%",mesBR(D.meses[D.meses.length-1])],["3 meses",u3.length&&u3.every(x=>x!=null)?br((u3.reduce((a,x)=>a*(1+x/100),1)-1)*100)+"%":"—",""],
     ["12 meses",w[0]==null?"—":br(w[0])+"%",w[1]==null?"":br(w[1],0)+"% do CDI"],["Vol / Sharpe 12m",(w[2]==null?"—":br(w[2])+"%")+" / "+(w[3]==null?"—":br(w[3])),""],
     ["Spread / duration",(p.spread??o.spread)==null?"—":"CDI+ "+br(p.spread??o.spread),(p.duration??o.duration)==null?"":br(p.duration??o.duration)+" anos"],
     ["Fundos com o ativo",(p.n_hoje??o.n??"—")+"",`já esteve em ${p.n_ever??"—"} • ${(p.temos??o.temos)?"nós temos":"não temos"}`]];
   n.innerHTML=`<td colspan="${ncol}"><div class="kpis">${k.map(x=>`<div class="k"><div class="r">${x[0]}</div><div class="v">${x[1]}</div><div class="x">${x[2]}</div></div>`).join("")}</div>
-   <div class="g2"><div><b>Retorno mensal do ativo × CDI</b><div id="${id}a" style="height:260px"></div></div><div><b>% do PL em cada fundo</b> <span class="mini">(laranja = nossos)</span><div id="${id}b" style="height:260px"></div></div>
-   <div><b>Spread CDI+ e PU informados pelos fundos (mediana)</b><div id="${id}c" style="height:260px"></div></div><div><b>ANBIMA: taxa indicativa e % do PU par (diário)</b><div id="${id}d" style="height:260px"></div></div></div>
-   <div id="${id}e"></div></td>`;
-  const M=D.meses;
-  if(d.r)plot(id+"a",[{x:M.map(mesBR),y:d.r,type:"bar",name:"ativo",marker:{color:d.r.map(v=>v==null?"#ccc":v>=0?"#1f5f87":"#b42318")},hovertemplate:"%{x}: %{y:.2f}%<extra></extra>"},
-    {x:M.map(mesBR),y:M.map(m=>D.cdi[m]),name:"CDI",mode:"lines",line:{color:"#111",dash:"dash"}}],LAY({yaxis:{title:{text:"% no mês"}},showlegend:true}));
-  const tl=Object.entries(d.pl).map(([fid,arr])=>({x:arr.map(a=>mesBR(M[a[0]])),y:arr.map(a=>a[1]),name:F[fid].nome,mode:"lines+markers",line:{color:F[fid].nosso?"#eb6834":"#9aa0a6",width:F[fid].nosso?2.5:1.2},marker:{size:4},
-    hovertemplate:`${esc(F[fid].nome)}: %{y:.2f}%<extra></extra>`}));
-  plot(id+"b",tl,LAY({showlegend:false,yaxis:{title:{text:"% do PL"}},xaxis:{type:"category",categoryorder:"array",categoryarray:M.map(mesBR)}}));
-  if(d.h)plot(id+"c",[{x:d.h.m.map(i=>mesBR(M[i])),y:d.h.sp,name:"spread CDI+ (%, eixo esquerdo)",mode:"lines+markers",line:{color:"#eb6834"}},
-    {x:d.h.m.map(i=>mesBR(M[i])),y:d.h.pu,name:"PU (R$, eixo direito)",mode:"lines+markers",line:{color:"#111",dash:"dot"},yaxis:"y2"}],
-    LAY({yaxis:{title:{text:"spread CDI+ (% a.a.)"}},yaxis2:{title:{text:"PU (R$)"},overlaying:"y",side:"right"},margin:{l:56,r:60,t:10,b:40}}));
-  if(d.anb)plot(id+"d",[{x:d.anb.d,y:d.anb.tx,name:`taxa indicativa (${d.anb.ind}, eixo esquerdo)`,mode:"lines+markers",line:{color:"#1f5f87"}},
-    {x:d.anb.d,y:d.anb.par,name:"% do PU par (eixo direito)",mode:"lines",line:{color:"#eb6834",dash:"dot"},yaxis:"y2"}],
+   <div class="g2"><div><b>Retorno total mensal do ativo × CDI</b><div id="${id}a" style="height:270px"></div></div><div><b>Curva acumulada: ativo × CDI</b> <span class="mini">(base 100, meses em que algum fundo tinha o ativo)</span><div id="${id}b" style="height:270px"></div></div>
+   <div><b>% do PL</b> <span class="mini" id="${id}pl"></span><div id="${id}c" style="height:260px"></div></div><div><b>Spread CDI+ e % do PU par</b> <span class="mini">(mediana entre os fundos; % do PU par pelo SND, só debêntures)</span><div id="${id}d" style="height:260px"></div></div>
+   <div><b>ANBIMA: taxa indicativa e % do PU par (diário)</b><div id="${id}e" style="height:260px"></div></div><div class="mini" id="${id}f" style="align-self:center;line-height:1.6"></div></div></td>`;
+  const M=D.meses,R=d.r||[],S=d.s||"",idx=M.map((m,i)=>i).filter(i=>R[i]!=null);if(!idx.length){$("#"+id+"a").innerHTML=$("#"+id+"b").innerHTML="<div class=\"mini\">Sem retorno mensal medido (ativo novo ou só em meses sem carteira anterior).</div>"}
+  const EV=d.ev||{},fonte=i=>(FONTE[S[i]]||"—")+(EV[i]!=null?` (queda de preço observada: ${br(EV[i])}%)`:""),est=idx.filter(i=>S[i]=="E"||S[i]=="A").length,nev=Object.keys(EV).length;
+  if(idx.length)plot(id+"a",[{x:idx.map(i=>mesBR(M[i])),y:idx.map(i=>D.cdi[M[i]]),type:"bar",name:"CDI",marker:{color:"#c9cdd3"},hovertemplate:"CDI %{x}: %{y:.2f}%<extra></extra>"},
+    {x:idx.map(i=>mesBR(M[i])),y:idx.map(i=>R[i]),type:"bar",name:"ativo",marker:{color:idx.map(i=>S[i]=="A"?"#eda100":S[i]=="E"?"#9ec5e8":R[i]>=0?"#1f5f87":"#b42318")},
+     text:idx.map(i=>fonte(i)),textposition:"none",hovertemplate:"ativo %{x}: %{y:.2f}%<br>%{text}<extra></extra>"}],LAY({barmode:"group",bargap:.15,yaxis:{title:{text:"% no mês"}},xaxis:{type:"category"}}));
+  let a=100,c=100;const ca=[],cc=[];idx.forEach(i=>{a*=1+R[i]/100;c*=1+D.cdi[M[i]]/100;ca.push(a);cc.push(c)});
+  if(idx.length)plot(id+"b",[{x:idx.map(i=>mesBR(M[i])),y:ca,name:"ativo",mode:"lines",line:{color:"#1f5f87",width:2.5},hovertemplate:"ativo: %{y:.1f}<extra>%{x}</extra>"},
+    {x:idx.map(i=>mesBR(M[i])),y:cc,name:"CDI",mode:"lines",line:{color:"#111",dash:"dash"},hovertemplate:"CDI: %{y:.1f}<extra>%{x}</extra>"}],LAY({yaxis:{title:{text:"base 100"}},xaxis:{type:"category"}}));
+  const ent=Object.entries(d.pl),meu=ent.filter(([fid])=>fid==ctx||F[fid].nosso),tl=meu.map(([fid,arr])=>({x:arr.map(q=>mesBR(M[q[0]])),y:arr.map(q=>q[1]),name:F[fid].nome+(fid==ctx&&!F[fid].nosso?" (este fundo)":""),
+    mode:"lines+markers",line:{color:fid==ctx&&!F[fid].nosso?"#111":"#eb6834",width:2.5},marker:{size:4},hovertemplate:`${esc(F[fid].nome)}: %{y:.2f}%<extra>%{x}</extra>`}));
+  if(!ctx||F[ctx].nosso){const pe=ent.filter(([fid])=>!F[fid].nosso),mm={};pe.forEach(([,arr])=>arr.forEach(q=>{(mm[q[0]]=mm[q[0]]||[]).push(q[1])}));
+    const ks=Object.keys(mm).map(Number).sort((x,y)=>x-y);if(ks.length)tl.push({x:ks.map(q=>mesBR(M[q])),y:ks.map(q=>mm[q].reduce((x,y)=>x+y)/mm[q].length),name:"média dos peers que têm",mode:"lines",line:{color:"#9aa0a6",width:2,dash:"dot"},
+      text:ks.map(q=>mm[q].length+" peers"),hovertemplate:"média peers: %{y:.2f}% (%{text})<extra>%{x}</extra>"})}
+  $("#"+id+"pl").textContent=ctx&&!F[ctx].nosso?`(${F[ctx].nome} em preto e nossos fundos em laranja)`:"(nossos fundos em laranja e média dos peers que têm)";
+  if(tl.length)plot(id+"c",tl,LAY({yaxis:{title:{text:"% do PL"}},xaxis:{type:"category",categoryorder:"array",categoryarray:M.map(mesBR)}}));else $("#"+id+"c").innerHTML='<div class="mini">Nem este fundo nem os nossos têm o ativo.</div>';
+  const h=d.h,temPar=h&&h.par.some(x=>x!=null);
+  if(h)plot(id+"d",[{x:h.m.map(i=>mesBR(M[i])),y:h.sp,name:"spread CDI+ (esq.)",mode:"lines+markers",line:{color:"#eb6834",width:2}},
+    ...(temPar?[{x:h.m.map(i=>mesBR(M[i])),y:h.par,name:"% do PU par (dir.)",mode:"lines+markers",line:{color:"#2a78d6",width:2,dash:"dot"},yaxis:"y2"}]:[])],
+    LAY({yaxis:{title:{text:"spread CDI+ (% a.a.)"}},yaxis2:{title:{text:"% do PU par"},overlaying:"y",side:"right"},xaxis:{type:"category"},margin:{l:56,r:60,t:10,b:40}}));
+  const an=d.anb,temTx=an&&an.tx.some(x=>x!=null),temAp=an&&an.par.some(x=>x!=null);
+  if(an&&(temTx||temAp))plot(id+"e",[...(temTx?[{x:an.d,y:an.tx,name:`taxa indicativa (${an.ind}) (esq.)`,mode:"lines+markers",line:{color:"#1f5f87",width:2}}]:[]),
+    ...(temAp?[{x:an.d,y:an.par,name:"% do PU par (dir.)",mode:"lines",line:{color:"#eb6834",width:2,dash:"dot"},yaxis:"y2"}]:[])],
     LAY({yaxis:{title:{text:"taxa (%)"}},yaxis2:{title:{text:"% PU par"},overlaying:"y",side:"right"},margin:{l:56,r:60,t:10,b:40}}));
-  else $("#"+id+"d").innerHTML=`<div class="mini">Sem marcação ANBIMA para este ativo (a ANBIMA marca debêntures; o histórico público começa em ${diaBR(D.anb_ini)} e cresce a cada atualização).</div>`;
-  $("#"+id+"e").innerHTML=d.neg?`<b>Últimos negócios de balcão (B3)</b><table class="t" style="margin-top:6px;max-width:640px"><tr><th class="l">Data</th><th>Hora</th><th>Taxa</th><th>PU</th><th>Volume (R$ mm)</th></tr>`+
-    d.neg.map(g=>`<tr><td class="l">${diaBR(g[0])}</td><td>${g[1]||""}</td><td>${br(g[2],4)}</td><td>${br(g[3],2)}</td><td>${br(g[4],2)}</td></tr>`).join("")+"</table>":`<div class="mini">Sem negócios de balcão na B3 nos últimos pregões.</div>`}
+  else $("#"+id+"e").innerHTML=`<div class="mini">Sem marcação ANBIMA para este ativo: de graça a ANBIMA só publica debêntures (CRI/CRA, LF, CDB, FIDC e NC não têm arquivo público). Histórico desde ${diaBR(D.anb_ini)}, cresce a cada atualização.</div>`;
+  $("#"+id+"f").innerHTML=`<b>Como o retorno do ativo é medido</b><br>Retorno total do mês, comparável ao CDI: preço + juros/amortização pagos, sem hedge nem resíduo do fundo.<br>`+
+   `• Debêntures: preço do fundo + o que foi pago no mês (queda do PU par do SND).<br>• FIDC: rentabilidade oficial da série (CVM).<br>• LF/LFSN/CDB: preço (não pagam no meio).<br>`+
+   `• CRI/CRA/NC/CCB: pagam todo mês e o fluxo não é público; preço abaixo do esperado = pagamento → fica carrego + curva. Queda grande que não volta pode ser amortização ou perda: fica o carrego e a barra fica amarela para conferir.<br>`+
+   `Este ativo: ${idx.length} meses, ${idx.length-est} com preço observado e ${est} estimados (barra azul clara)${nev?` • <b style="color:#b26b00">${nev} mês(es) com queda forte de preço (barra amarela)</b>`:""}.`}
 // ---------- fundo
 $("#f_sel").innerHTML=[...D.fundos].sort((a,b)=>(b.nosso-a.nosso)||a.nome.localeCompare(b.nome)).map(f=>`<option value="${f.id}">${f.nosso?"★ ":""}${esc(f.nome)}</option>`).join("");
 $("#f_sel").onchange=fundo;["#f_mes","#f_cat","#f_busca"].forEach(s=>$(s).oninput=tabFundo);
-let topModo="ret";document.querySelectorAll("#a_fundo .chip[data-m]").forEach(e=>e.onclick=()=>{topModo=e.dataset.m;document.querySelectorAll("#a_fundo .chip[data-m]").forEach(x=>x.classList.toggle("on",x==e));topFundo()});
+const tOrd={k:"ret",asc:false};document.querySelectorAll("#a_fundo .chip[data-m]").forEach(e=>e.onclick=()=>{tOrd.k=e.dataset.m;tOrd.asc=false;document.querySelectorAll("#a_fundo .chip[data-m]").forEach(x=>x.classList.toggle("on",x==e));topFundo()});
+$("#f_topcat").oninput=topFundo;
 function fundo(){const f=F[$("#f_sel").value],c=ultAb(f);
   $("#f_info").innerHTML=`${f.cnpj} • última CDA ${mesBR(f.carteira.length?f.carteira[f.carteira.length-1].m:null)} • última carteira aberta ${mesBR(f.abertos[f.abertos.length-1])} • cota até ${diaBR(f.ult_cota)}${f.distribui?" • distribui rendimentos (retorno total)":""}`;
   const k=[["PL","R$ "+br(f.pl,0)+" mm",""],["12 meses",pcdi(f,12)==null?"—":br(pcdi(f,12),0)+"% do CDI",acum(f,12)?br(acum(f,12)[0])+"%":""],["No ano",pcdi(f,ytdN)==null?"—":br(pcdi(f,ytdN),0)+"% do CDI",""],
@@ -2352,20 +2319,20 @@ function fundo(){const f=F[$("#f_sel").value],c=ultAb(f);
     LAYR({barmode:"stack",bargap:0,yaxis:{ticksuffix:"%",title:{text:"% do PL"}},xaxis:{type:"category"}}));
   const op=$("#f_sdcat .op");op.innerHTML=["Total",...cats].map((k,i)=>`<label><input type="checkbox" value="${esc(k)}"${i==0?" checked":""}> ${k=="Total"?"<b>Carteira total</b>":esc(k)}</label>`).join("");
   op.querySelectorAll("input").forEach(x=>x.onchange=spdur);spdur();
-  const ms=meses.slice(-24), cr=Object.keys(f.ret_cats);
-  const tr=cr.map(k=>({x:ms.map(mesBR),y:ms.map(m=>{const i=f.ret_meses.indexOf(m);return i<0?null:f.ret_cats[k][i]}),name:k,type:"bar",marker:{color:corCat(k)},hovertemplate:`${k}: %{y:.3f} pp<extra>%{x}</extra>`}));
-  tr.push({x:ms.map(mesBR),y:ms.map(m=>f.ret[m]),name:"retorno da cota",mode:"lines+markers",line:{color:"#eb6834",width:3},hovertemplate:"cota: %{y:.2f}%<extra>%{x}</extra>"},
-    {x:ms.map(mesBR),y:ms.map(m=>D.cdi[m]),name:"CDI",mode:"lines",line:{color:"#111",dash:"dash"},hovertemplate:"CDI: %{y:.2f}%<extra>%{x}</extra>"});
+  const ms=meses.slice(-24), pre=new Set((D.preench||{})[f.id]||[]), rot=m=>mesBR(m)+(pre.has(m)?"*":""), cr=Object.keys(f.ret_cats).filter(k=>k!="Confidencial"||ms.some(m=>{const i=f.ret_meses.indexOf(m);return i>=0&&Math.abs(f.ret_cats[k][i]||0)>.001}));
+  const tr=cr.map(k=>({x:ms.map(rot),y:ms.map(m=>{const i=f.ret_meses.indexOf(m);return i<0?null:f.ret_cats[k][i]}),name:k,type:"bar",marker:{color:corCat(k)},hovertemplate:`${k}: %{y:.3f} pp<extra>%{x}</extra>`}));
+  tr.push({x:ms.map(rot),y:ms.map(m=>f.ret[m]),name:"retorno da cota",mode:"lines+markers",line:{color:"#eb6834",width:3},hovertemplate:"cota: %{y:.2f}%<extra>%{x}</extra>"},
+    {x:ms.map(rot),y:ms.map(m=>D.cdi[m]),name:"CDI",mode:"lines",line:{color:"#111",dash:"dash"},hovertemplate:"CDI: %{y:.2f}%<extra>%{x}</extra>"});
   plot("f_ret",tr,LAYR({barmode:"relative",yaxis:{ticksuffix:"%",title:{text:"% no mês"}}}));
   const mm=[...new Set(D.ativos.filter(a=>a[0]==f.id).map(a=>a[1]))].sort().reverse();
   $("#f_mes").innerHTML=mm.map(m=>`<option value="${m}">${mesBR(m)}</option>`).join("")||"<option>sem carteira aberta</option>";
   $("#f_cat").innerHTML="";tabFundo();topFundo();mudancas()}
 function spdur(){const f=F[$("#f_sel").value],ab=f.carteira.filter(x=>x.ab),sel=[...document.querySelectorAll("#f_sdcat input:checked")].map(x=>x.value);
-  $("#f_sdcat summary").textContent=`Categorias (${sel.length}) ▾`;const tr=[];
-  sel.forEach(k=>{const c=k=="Total"?"#111":corCat(k),get=(x,i)=>k=="Total"?(i==1?x.sp:x.du):(x.cats[k]||[])[i];
-    tr.push({x:ab.map(x=>mesBR(x.m)),y:ab.map(x=>get(x,1)),name:`${k=="Total"?"Carteira":k} — spread`,mode:"lines+markers",line:{color:c,width:2},marker:{size:4},hovertemplate:`${k} spread: CDI+ %{y:.2f}%<extra>%{x}</extra>`},
-     {x:ab.map(x=>mesBR(x.m)),y:ab.map(x=>get(x,2)),name:`${k=="Total"?"Carteira":k} — duration`,mode:"lines",line:{color:c,width:2,dash:"dash"},yaxis:"y2",hovertemplate:`${k} duration: %{y:.2f} anos<extra>%{x}</extra>`})});
-  plot("f_sd",tr,LAYR({yaxis:{title:{text:"Spread CDI+ (% a.a.) — linha cheia"}},yaxis2:{title:{text:"Duration (anos) — tracejada"},overlaying:"y",side:"right"},xaxis:{type:"category"},margin:{l:56,r:230,t:10,b:40},legend:{x:1.08,y:1,xanchor:"left",font:{size:10}}}))}
+  $("#f_sdcat summary").textContent=`Categorias (${sel.length}) ▾`;const tr=[],SPC=["#eb6834","#2a78d6","#1baf7a","#e34948","#9775fa","#eda100"],DUC=["#111111","#0b7285","#5d6470","#8a5a00","#a61e4d","#3d348b"];
+  sel.forEach((k,i)=>{const get=(x,j)=>k=="Total"?(j==1?x.sp:x.du):(x.cats[k]||[])[j],nm=k=="Total"?"Carteira":k;
+    tr.push({x:ab.map(x=>mesBR(x.m)),y:ab.map(x=>get(x,1)),name:`${nm} — spread (esq.)`,mode:"lines+markers",line:{color:SPC[i%6],width:2.2},marker:{size:4},hovertemplate:`${nm} spread: CDI+ %{y:.2f}%<extra>%{x}</extra>`},
+     {x:ab.map(x=>mesBR(x.m)),y:ab.map(x=>get(x,2)),name:`${nm} — duration (dir.)`,mode:"lines",line:{color:DUC[i%6],width:2,dash:"dash"},yaxis:"y2",hovertemplate:`${nm} duration: %{y:.2f} anos<extra>%{x}</extra>`})});
+  plot("f_sd",tr,LAYR({yaxis:{title:{text:"Spread CDI+ (% a.a.) — linhas cheias"}},yaxis2:{title:{text:"Duration (anos) — tracejadas"},overlaying:"y",side:"right"},xaxis:{type:"category"},margin:{l:56,r:250,t:10,b:40},legend:{x:1.08,y:1,xanchor:"left",font:{size:10}}}))}
 function tabFundo(){const f=F[$("#f_sel").value],m=$("#f_mes").value,b=$("#f_busca").value.toLowerCase();
   const rs=D.ativos.filter(a=>a[0]==f.id&&a[1]==m), cats=[...new Set(rs.map(a=>a[4]))].sort();
   if(!$("#f_cat").options.length)$("#f_cat").innerHTML='<option value="">todas as categorias</option>'+cats.map(c=>`<option>${c}</option>`).join("");
@@ -2373,11 +2340,15 @@ function tabFundo(){const f=F[$("#f_sel").value],m=$("#f_mes").value,b=$("#f_bus
   const L=rs.filter(a=>(!c||a[4]==c)&&(a[3]+" "+a[5]+" "+a[6]).toLowerCase().includes(b)).sort((x,y)=>y[7]-x[7]), nc=f.nosso?8:9;
   $("#f_tab").innerHTML="<tr><th class='l'>Ativo</th><th class='l'>Categoria</th><th class='l'>Grupo</th><th>% PL</th><th>R$ mm</th><th>Spread CDI+</th><th>Duration</th><th>Retorno 12m</th>"+(f.nosso?"":"<th>Nós temos?</th>")+"</tr>"+
    L.map(a=>{const p=PERF[a[2]];return`<tr class="cl" data-ch="${esc(a[2])}"><td class="l">${esc(a[3])}</td><td class="l"><span class="ponto" style="background:${corCat(a[4])}"></span>${esc(a[4])}</td><td class="l mut">${esc(a[5])}</td><td>${br(a[7])}</td><td>${br(a[8],1)}</td><td>${br(a[9])}</td><td>${br(a[10])}</td><td class="${cls(p&&p.w12[0])}">${p&&p.w12[0]!=null?br(p.w12[0])+"%":"—"}</td>${f.nosso?"":`<td>${temos.has(a[2])?"sim":'<b class="neg">não</b>'}</td>`}</tr>`}).join("");
-  $("#f_tab").querySelectorAll("tr.cl").forEach(t=>t.onclick=()=>detalheAtivo(t,t.dataset.ch,nc))}
-function topFundo(){const f=F[$("#f_sel").value],L=[...(D.f_top[f.id]||[])].sort((a,b)=>topModo=="ret"?(b[3]??-1e9)-(a[3]??-1e9):(b[4]??-1e9)-(a[4]??-1e9)).slice(0,25);
-  $("#f_top").innerHTML="<tr><th class='l'>#</th><th class='l'>Ativo</th><th class='l'>Categoria</th><th>Retorno 12m</th><th>Contribuição (bps)</th><th>% PL médio</th><th>Meses na carteira</th></tr>"+
-   L.map((a,i)=>`<tr class="cl" data-ch="${esc(a[0])}"><td class="l">${i+1}</td><td class="l">${esc(a[1])}</td><td class="l"><span class="ponto" style="background:${corCat(a[2])}"></span>${esc(a[2])}</td><td class="${cls(a[3])}"${topModo=="ret"?' style="font-weight:bold"':""}>${br(a[3])}%</td><td class="${cls(a[4])}"${topModo=="bps"?' style="font-weight:bold"':""}>${br(a[4],1)}</td><td>${br(a[5])}</td><td>${a[6]}</td></tr>`).join("");
-  $("#f_top").querySelectorAll("tr.cl").forEach(t=>t.onclick=()=>detalheAtivo(t,t.dataset.ch,7))}
+  $("#f_tab").querySelectorAll("tr.cl").forEach(t=>t.onclick=()=>detalheAtivo(t,t.dataset.ch,nc,f.id))}
+function topFundo(){const f=F[$("#f_sel").value],todos=D.f_top[f.id]||[],cats=[...new Set(todos.map(a=>a[2]))].sort();
+  if($("#f_topcat").dataset.f!=f.id){$("#f_topcat").innerHTML='<option value="">todas as categorias</option>'+cats.map(c=>`<option>${esc(c)}</option>`).join("");$("#f_topcat").dataset.f=f.id}
+  const c=$("#f_topcat").value;
+  const L=ordena(todos.filter(a=>!c||a[2]==c).map(a=>({ch:a[0],ativo:a[1],cat:a[2],ret:a[3],bps:a[4],perc:a[5],n:a[6]})),tOrd).slice(0,40);
+  const C=[["ativo","Ativo","l"],["cat","Categoria","l"],["ret","Retorno 12m"],["bps","Contribuição (bps)"],["perc","% PL médio"],["n","Meses na carteira"]];
+  $("#f_top").innerHTML=th(C,tOrd)+L.map(a=>`<tr class="cl" data-ch="${esc(a.ch)}"><td class="l">${esc(a.ativo)}</td><td class="l"><span class="ponto" style="background:${corCat(a.cat)}"></span>${esc(a.cat)}</td><td class="${cls(a.ret)}">${a.ret==null?"—":br(a.ret)+"%"}</td><td class="${cls(a.bps)}">${br(a.bps,1)}</td><td>${br(a.perc)}</td><td>${a.n}</td></tr>`).join("");
+  cabec($("#f_top"),C,tOrd,()=>{document.querySelectorAll("#a_fundo .chip[data-m]").forEach(x=>x.classList.toggle("on",x.dataset.m==tOrd.k));topFundo()});
+  $("#f_top").querySelectorAll("tr.cl").forEach(t=>t.onclick=()=>detalheAtivo(t,t.dataset.ch,C.length,f.id))}
 function mudancas(){const f=F[$("#f_sel").value],ms=[...new Set(D.ativos.filter(a=>a[0]==f.id).map(a=>a[1]))].sort();
   if(ms.length<2){$("#f_mud_sub").textContent="Precisa de duas carteiras abertas.";$("#f_mud_up").innerHTML=$("#f_mud_dn").innerHTML="";return}
   const [m0,m1]=ms.slice(-2),pega=m=>{const o={};D.ativos.filter(a=>a[0]==f.id&&a[1]==m&&!["Caixa","Títulos Públicos","Ajuste"].includes(a[4])).forEach(a=>{o[a[2]]=o[a[2]]||{r:a[3],c:a[4],p:0};o[a[2]].p+=a[7]});return o};
@@ -2385,7 +2356,7 @@ function mudancas(){const f=F[$("#f_sel").value],ms=[...new Set(D.ativos.filter(
   $("#f_mud_sub").textContent=`${mesBR(m0)} → ${mesBR(m1)} (carteiras abertas) • variação em pontos de % do PL`;
   const tb=(arr)=>"<tr><th class='l'>Ativo</th><th class='l'>Categoria</th><th>Antes</th><th>Depois</th><th>Δ pp</th></tr>"+arr.map(x=>`<tr class="cl" data-ch="${esc(x.k)}"><td class="l">${esc(x.r)}${!x.a?' <span class="tag" style="background:#1f7a4d">NOVO</span>':!x.b?' <span class="tag" style="background:#b42318">SAIU</span>':""}</td><td class="l mut">${esc(x.c)}</td><td>${br(x.a)}</td><td>${br(x.b)}</td><td class="${cls(x.d)}"><b>${x.d>0?"+":""}${br(x.d)}</b></td></tr>`).join("");
   $("#f_mud_up").innerHTML=tb(L.filter(x=>x.d>0.005).sort((a,b)=>b.d-a.d).slice(0,15));$("#f_mud_dn").innerHTML=tb(L.filter(x=>x.d<-0.005).sort((a,b)=>a.d-b.d).slice(0,15));
-  ["#f_mud_up","#f_mud_dn"].forEach(s=>$(s).querySelectorAll("tr.cl").forEach(t=>t.onclick=()=>detalheAtivo(t,t.dataset.ch,5)))}
+  ["#f_mud_up","#f_mud_dn"].forEach(s=>$(s).querySelectorAll("tr.cl").forEach(t=>t.onclick=()=>detalheAtivo(t,t.dataset.ch,5,f.id)))}
 // ---------- performance de ativos
 const RV=["Ações","FII","FIP","ETF","Fundos offshore","Cotas de Fundos"],vc=[...new Set(D.perf.map(p=>p.categoria))].sort();
 $("#v_cat").innerHTML='<option value="_cred">crédito (sem renda variável/offshore)</option><option value="">todas as categorias</option>'+vc.map(c=>`<option>${esc(c)}</option>`).join("");
@@ -2414,12 +2385,6 @@ function peers(){const c=$("#p_cat").value,mn=+$("#p_min").value,so=$("#p_so").c
   const G=D.grupos.filter(g=>(!c||g.categorias.includes(c))&&g.grupo.toLowerCase().includes(b)).map(g=>({...g,dif:(g.peers_perc||0)-(g.nossos_perc||0)})).sort((a,x)=>x.dif-a.dif).slice(0,60);
   $("#p_gru").innerHTML="<tr><th class='l'>Grupo</th><th class='l'>Categorias</th><th>Peers: % PL médio</th><th>Nossos: % PL médio</th><th>Diferença</th><th>Nº peers</th><th>Nº nossos</th><th>R$ mm (peers)</th></tr>"+
    G.map(g=>`<tr><td class="l">${esc(g.grupo)}</td><td class="l mut">${esc(g.categorias.join(", "))}</td><td>${br(g.peers_perc)}</td><td>${br(g.nossos_perc)}</td><td class="${g.dif>0?"neg":"pos"}"><b>${g.dif>0?"+":""}${br(g.dif)}</b></td><td>${g.n_peers}</td><td>${g.n_nossos}</td><td>${br(g.rs_peers,1)}</td></tr>`).join("")}
-// ---------- novidades
-$("#n_lista").innerHTML=D.primeira_vez?'<div class="sub">Primeira geração do painel: a partir da próxima atualização aparecem aqui os fundos que abriram carteira, publicaram CDA ou atualizaram cota.</div>':
-  (D.novidades.length?'<ul class="nv">'+D.novidades.map(n=>`<li><span class="ponto" style="background:${cor(F[n.id])}"></span><span class="lk" data-id="${n.id}">${esc(F[n.id].nome)}</span>: ${esc(n.o_que)}</li>`).join("")+"</ul>":'<div class="sub">Nada novo desde a última atualização.</div>');
-$("#n_lista").querySelectorAll(".lk").forEach(e=>e.onclick=()=>abreFundo(e.dataset.id));
-$("#n_sub").textContent=D.candidatos.length?`CDA de ${mesBR(D.mes_candidatos)} (todos os fundos da CVM) • PL ≥ R$ 300 mm, ≥ 50% em crédito e ≥ 10% do PL nos mesmos papéis (código) que nossos fundos ou os peers têm • sem os masters/FICs dos fundos já acompanhados`:"Não calculado (sem a CDA completa no cache).";
-$("#n_cand").innerHTML=D.candidatos.length?"<tr><th class='l'>Fundo</th><th class='l'>CNPJ</th><th>PL (R$ mm)</th><th>% em crédito</th><th>% em comum</th></tr>"+D.candidatos.map(c=>`<tr><td class="l">${esc(c.nome)}</td><td class="l">${c.cnpj}</td><td>${br(c.pl,0)}</td><td>${br(c.pct_credito,0)}%</td><td><b>${br(c.pct_comum,0)}%</b></td></tr>`).join(""):"";
 geral();fundo();perf();peers();vai(ABAS.some(a=>"#"+a[0]==location.hash)?location.hash.slice(1):"a_geral");
 </script></body></html>
 '''   # painel em HTML (arquivo unico)
