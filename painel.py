@@ -1089,7 +1089,7 @@ CAT_CORES = ["#2a78d6", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7", "#008300", "
 NOSSAS_CORES = ["#eb6834", "#c24f1d", "#f29a6b", "#a8401a", "#f5b38d"]
 GENERICO = (r"(?i)\b(FUNDO DE INVESTIMENTO|FUNDO|EM DIREITOS CREDIT[OÓ]RIOS|DE INVESTIMENTO|FIDC|FIC|FI|COTAS|MULTIMERCADO|"
             r"RENDA FIXA|CR[EÉ]DITO PRIVADO|RESPONSABILIDADE LIMITADA|RESP LTDA|N[AÃ]O PADRONIZADO|NP|LONGO PRAZO|LP)\b")
-METODO = 30                                     # suba quando mudar o calculo -> refaz o cache do dia
+METODO = 31                                     # suba quando mudar o calculo -> refaz o cache do dia
 CAIXA = ("Caixa",)
 CAIXA_CVM = ("Disponibilidades", "Operações Compromissadas", "Valores a receber", "Valores a pagar", lt.AJUSTE)
 TIPO_CASA = {"CDB/ RDB": "CDB", "CDB Vinculado": "CDB", "DPGE": "DPGE", "FI Imobiliário": "FII", "FI Participações": "FIP",
@@ -1468,7 +1468,8 @@ class Contexto:
         base = np.where(di, cdi, np.where(np.isin(idx, ["IPCA", "IGP-M", "INPC"]), inf, np.where(idx == "PRE", 0.0, np.nan)))
         padrao = np.isfinite(s) & (np.nan_to_num(jur) > 0) | (di & (pct > 100))
         pag = np.clip(p0 * (1 + base) * (1 + np.nan_to_num(s) / 100) ** (1 / 12) - p1, 0, None)
-        pag = np.where((p1 < p0) & (pag > 0.005 * p0), pag, 0.0)   # evento de verdade derruba o PU par; mes sem evento so acumula
+        pag = np.where(pag > 0.005 * p0, pag, 0.0)   # pagamento = PU par esperado (anterior + remuneracao) - observado; juros mensais
+                                                     # deixam o PU par do fim do mes ~igual ao anterior, por isso nao exige queda
         ok = padrao & np.isfinite(pag) & (p0 > 0) & (p1 > 0) & np.isfinite(pu_ant)
         return np.where(ok, pag, np.nan)
 
@@ -2210,6 +2211,14 @@ def _metricas(r, cdi):
     return [_r(a), _r(a / c * 100 if c > 0 else np.nan, 0), _r(vol), _r(sh), n]
 
 
+class ContextoSecurit(Contexto):
+    """So o informe das securitizadoras (para o % do VNA dos CRI/CRA no HTML)."""
+    def __init__(self):
+        self.sec, self.sec_dev = lt.securitizadoras(lambda m: None)
+        self.sec_m = self.sec.drop_duplicates(["serie", "mes"]).set_index(["serie", "mes"])[["V", "Q", "P", "vna", "pago"]]
+        self.series = set(self.sec.serie)
+
+
 def exporta_html(pasta=None, saida=None, log=print):
     """Le o painel processado (pasta do dia) e grava um HTML unico com tudo embutido (abre com dois cliques, sem servidor)."""
     pasta = Path(pasta or PRE.get("pasta") or pasta_dia())
@@ -2219,7 +2228,7 @@ def exporta_html(pasta=None, saida=None, log=print):
     cdi_m = _ret_mensal(V["datas"], V["cdi"])
     ult_dia = pd.Timestamp(V["datas"][-1])                               # mes corrente so conta quando fechar
     ult_completo = str(ult_dia.to_period("M") if ult_dia == ult_dia + pd.offsets.BMonthEnd(0) else ult_dia.to_period("M") - 1)
-    fundos, ativos, contrib, pos = [], [], [], []
+    fundos, ativos, contrib, pos, escondido = [], [], [], [], set()
     for f in V["fundos"]:
         jf = pasta / (f["id"] + ".json")
         F = json.loads(jf.read_text(encoding="utf-8")) if jf.exists() else None
@@ -2233,6 +2242,7 @@ def exporta_html(pasta=None, saida=None, log=print):
                 abertos.append(c["mes"])
         ret = (F or {}).get("retorno", {})
         meses_ret = [m["mes"] for m in ret.get("meses", [])]
+        escondido |= {(f["id"], m["mes"]) for m in ret.get("meses", []) if m.get("preench")}
         lista = ret.get("ativos", [])
         for c_ in ret.get("contrib", []):          # [ativo, mes, contribuicao (pp do PL), peso (% PL), retorno do ativo (%), fonte]
             i_a, jm, v, p = c_[:4]
@@ -2252,7 +2262,7 @@ def exporta_html(pasta=None, saida=None, log=print):
             t = pd.read_parquet(ja)
             t = t[~t.categoria.isin(["Confidencial"]) & (t.perc.abs() >= .005)]
             t = t.assign(chave=[_chave(c, r) for c, r in zip(t.codigo, t.rotulo)], id=f["id"])
-            pos.append(t.reindex(columns=["id", "mes", "chave", "rotulo", "categoria", "grupo", "emissor", "perc", "pct_par", "spread", "duration"]))
+            pos.append(t.reindex(columns=["id", "mes", "chave", "rotulo", "categoria", "grupo", "emissor", "perc", "pct_par", "spread", "duration", "pu"]))
             pls = {c["m"]: c["pl"] for c in carteira}
             for r in t[t.mes.isin(abertos[-MESES_ATIVOS:])].itertuples():
                 ativos.append([f["id"], r.mes, r.chave, str(r.rotulo), r.categoria, str(r.grupo or ""), str(r.emissor or ""),
@@ -2263,7 +2273,18 @@ def exporta_html(pasta=None, saida=None, log=print):
     P = pd.concat(pos, ignore_index=True) if pos else pd.DataFrame(columns=["id", "mes", "chave", "rotulo", "categoria", "grupo", "emissor", "perc"])
     P = P.groupby(["id", "mes", "chave"], as_index=False).agg(rotulo=("rotulo", "first"), categoria=("categoria", "first"),
                                                               grupo=("grupo", "first"), emissor=("emissor", "first"), perc=("perc", "sum"),
-                                                              pct_par=("pct_par", "median"), spread=("spread", "median"), duration=("duration", "median"))
+                                                              pct_par=("pct_par", "median"), spread=("spread", "median"), duration=("duration", "median"),
+                                                              pu=("pu", "first"))
+    # CRI/CRA casados com a serie da securitizadora: % do VNA (PU do fundo / valor nominal atualizado da serie)
+    sec = ContextoSecurit()
+    cr = P.categoria.isin(["CRI", "CRA"]) & P.chave.isin(sec.series)
+    P.loc[cr, "pct_par"] = [(pu / v * 100 if np.isfinite(v) and v > 0 else np.nan) for pu, v in
+                            zip(P.pu[cr], [sec.ancora(c, m, pu)[0] for c, m, pu in zip(P.chave[cr], P.mes[cr], P.pu[cr])])]
+    P["pct_par"] = P.pct_par.where(P.pct_par.between(30, 130))
+    # spread que contradiz o preco (abaixo do par com spread baixo: fluxo reestruturado, default, preco parado) -> sem spread
+    lim = 0.5 * (100 - P.pct_par) / P.duration.clip(lower=0.5).fillna(1) - 3
+    P["spread"] = P.spread.mask((P.pct_par < 97) & (P.spread < lim))
+    P = P[[m <= ult.get(i, "") for i, m in zip(P.id, P.mes)]]       # corte de cada fundo: ultima carteira aberta
     P["nosso"] = P.id.map(nosso)
     P["rs"] = [(p or 0) / 100 * (pls_mes.get((i, m)) or 0) for i, m, p in zip(P.id, P.mes, P.perc)]
     U = P[[ult.get(i) == m for i, m in zip(P.id, P.mes)] & ~P.categoria.isin(FORA_PERF)]     # ultima carteira aberta de cada fundo
@@ -2284,9 +2305,15 @@ def exporta_html(pasta=None, saida=None, log=print):
     mi = {m: i for i, m in enumerate(meses)}
     cdi_v = np.array([cdi_m[m] * 100 for m in meses])
     C = pd.DataFrame(contrib, columns=["id", "chave", "rotulo", "categoria", "grupo", "emissor", "mes", "v", "p", "r", "src"])
-    C = C[C.mes.isin(mi) & (C.p > 0.01) & C.r.notna()]
+    C = C[C.mes.isin(mi) & (C.p > 0.01) & C.r.notna() & (C.mes <= C.id.map(ult).fillna(""))]
+    tem = set(zip(P.id, P.mes, P.chave))
+    ant = {m: (pd.Period(m) - 1).strftime("%Y-%m") for m in C.mes.unique()}
+    C["oculto"] = [(i, m) in escondido and (i, ant[m], c) not in tem for i, m, c in zip(C.id, C.mes, C.chave)]
+    Co = C[~C.oculto]                                   # posicao estimada de carteira escondida nao e observacao do ativo
+    est = Co.src.eq("E")                                # no mesmo mes, fundo com preco observado vale mais que carrego estimado
+    Co = Co[~(est & (~est).groupby([Co.chave, Co.mes]).transform("any"))]
     # retorno do ativo no mes = retorno total do proprio ativo (preco + pagamentos; sem hedge/residuo do fundo), medio ponderado entre fundos
-    agg = C.assign(rp=C.r * C.p).sort_values("p").groupby(["chave", "mes"]).agg(rp=("rp", "sum"), p=("p", "sum"), src=("src", "last")).reset_index()
+    agg = Co.assign(rp=Co.r * Co.p).sort_values("p").groupby(["chave", "mes"]).agg(rp=("rp", "sum"), p=("p", "sum"), src=("src", "last")).reset_index()
     agg["r"] = agg.rp / agg.p
     # CRI/CRA/NC/CCB: queda grande de preco que fica pode ser amortizacao ou perda (fluxo nao publico): no retorno fica o carrego
     # (CDI + spread do papel) e o mes e marcado "A" com a queda observada, para o usuario conferir
@@ -2298,7 +2325,7 @@ def exporta_html(pasta=None, saida=None, log=print):
     agg.loc[ev, "r"] = car
     agg.loc[ev, "src"] = "A"
     agg = agg[agg.r.between(-60, 60)]
-    info = C.groupby("chave").agg(rotulo=("rotulo", "last"), categoria=("categoria", "last"), grupo=("grupo", "last"),
+    info = Co.groupby("chave").agg(rotulo=("rotulo", "last"), categoria=("categoria", "last"), grupo=("grupo", "last"),
                                   emissor=("emissor", "last"), n_ever=("id", "nunique"))
     ult_pos = U.groupby("chave").agg(n_hoje=("id", "nunique"), perc_med=("perc", "mean"), rs=("rs", "sum"),
                                      spread=("spread", "median"), duration=("duration", "median"),
@@ -2345,12 +2372,14 @@ def exporta_html(pasta=None, saida=None, log=print):
     except Exception as e:
         log(f"   ANBIMA: sem histórico ({type(e).__name__})")
         anb = {}
+    snd_ind = lt.snd_caracteristicas().indice
+    cat_ch = P.groupby("chave").categoria.last()
     det = {ch: {"r": [_r(x, 3) for x in series[ch]] if ch in series else None, "s": fontes.get(ch), "ev": eventos.get(ch), "pl": pl_hist.get(ch, {}),
-                "h": med_h.get(ch), "anb": anb.get(ch)} for ch in det_ch}
+                "h": med_h.get(ch), "anb": anb.get(ch), "cat": cat_ch.get(ch), "ind": snd_ind.get(ch)} for ch in det_ch}
     # ---------------- melhores ativos de cada fundo (12 meses): retorno e contribuicao em bps
     f_top = {}
     m12 = set(meses[-12:])
-    for fid, g in C[C.mes.isin(m12)].groupby("id"):
+    for fid, g in C[~C.oculto & C.mes.isin(m12)].groupby("id"):    # sem posicoes estimadas de carteira escondida
         x = g.groupby("chave").agg(rotulo=("rotulo", "last"), categoria=("categoria", "last"), v=("v", "sum"), p=("p", "mean"), n=("mes", "nunique"))
         g = g.assign(r=g.r.where(g.src.ne("L"), np.nan))
         g = g.assign(r=g.r.fillna(g.chave.map(lambda c: np.nan)).fillna(g.mes.map(lambda m: ((1 + cdi_m.get(m, 0)) * 1.02 ** (1 / 12) - 1) * 100)))
@@ -2409,6 +2438,9 @@ table.t tr.nosso td:first-child{border-left:4px solid var(--nosso)}table.t tr.cl
 details.ms{position:relative;display:inline-block}details.ms summary{list-style:none;cursor:pointer;border:1px solid var(--b);border-radius:6px;padding:6px 10px;background:#fff}
 details.ms .op{position:absolute;z-index:9;background:#fff;border:1px solid var(--b);border-radius:8px;padding:8px 12px;max-height:280px;overflow:auto;min-width:220px;box-shadow:0 6px 18px rgba(0,0,0,.12)}
 details.ms label{display:block;padding:2px 0;white-space:nowrap}.mini{font-size:11px;color:var(--s);margin:4px 0 0}
+.cx>h2,.bx>.tt{cursor:pointer;user-select:none}.cx>h2::before,.bx>.tt::before{content:"▾ ";color:var(--s)}
+.cx.fechado>h2::before,.bx.fechado>.tt::before{content:"▸ "}.cx.fechado>h2{margin:0}.cx.fechado>:not(h2),.bx.fechado>:not(.tt){display:none}
+.per{margin-left:auto;display:flex;gap:6px;align-items:center;font-size:12px;color:var(--s);padding:6px 0}.per select{padding:4px 6px}
 </style></head><body>
 <header><div><h1>Painel de Fundos — nossos × peers</h1><div class="s" id="hsub"></div></div>
 </header>
@@ -2428,7 +2460,7 @@ details.ms label{display:block;padding:2px 0;white-space:nowrap}.mini{font-size:
   <div class="cx"><h2>Retorno mensal × CDI e de onde veio (por categoria)</h2><div id="f_ret" style="height:380px"></div></div>
   <div class="cx"><h2>Carteira</h2><div class="ctl"><select id="f_mes"></select><select id="f_cat"></select><input id="f_busca" placeholder="buscar ativo/emissor"></div><div class="scroll"><table class="t" id="f_tab"></table></div></div>
   <div class="cx"><h2>Melhores ativos do fundo — últimos 12 meses</h2><div class="ctl"><span class="chip on" data-m="ret">Retorno do ativo</span><span class="chip" data-m="bps">Contribuição para o fundo (bps)</span><select id="f_topcat"></select></div><div class="scroll"><table class="t" id="f_top"></table></div></div>
-  <div class="cx"><h2>Mudanças na carteira</h2><div class="sub" id="f_mud_sub"></div><div class="g2"><div><b>Entradas e aumentos</b><table class="t" id="f_mud_up"></table></div><div><b>Saídas e reduções</b><table class="t" id="f_mud_dn"></table></div></div></div>
+  <div class="cx"><h2>Mudanças na carteira</h2><div class="sub" id="f_mud_sub"></div><div class="g2"><div class="bx"><b class="tt">Entradas e aumentos</b><table class="t" id="f_mud_up"></table></div><div class="bx"><b class="tt">Saídas e reduções</b><table class="t" id="f_mud_dn"></table></div></div></div>
 </section>
 <section class="aba" id="a_perf">
   <div class="ctl"><select id="v_jan"><option value="w12">Últimos 12 meses</option><option value="w36">Últimos 36 meses</option><option value="wt">Desde o início</option></select>
@@ -2460,18 +2492,41 @@ const CORES={"DEB":"#2a78d6","DEBIN":"#7ba7d9","FIDC":"#e87ba4","LF":"#4a3aa7","
 const corCat=c=>CORES[c]||CC[c]||(CC[c]=["#3bc9db","#b197fc","#ff8787","#63e6be","#ffa94d","#748ffc","#c0eb75","#f783ac"][ci++%8]);
 const LAY=x=>Object.assign({margin:{l:56,r:16,t:10,b:40},font:{size:11},legend:{orientation:"h",x:0,y:1.12,font:{size:10}},hovermode:"closest"},x||{});
 const LAYR=x=>LAY(Object.assign({margin:{l:56,r:170,t:10,b:40},legend:{x:1.02,y:1,xanchor:"left",font:{size:10}}},x||{}));    // legenda ao lado: nunca em cima do grafico
-const plot=(id,d,l)=>Plotly.newPlot(id,d,l,{displayModeBar:false,responsive:true});
+const MESES_P=Object.keys(D.cdi).sort().filter(m=>m<=D.ult_mes_completo);let PER=[MESES_P[Math.max(0,MESES_P.length-24)],MESES_P[MESES_P.length-1]];
+const noPer=m=>m>=PER[0]&&m<=PER[1],ymLab=x=>{if(typeof x!="string")return null;if(/^\d{4}-\d{2}/.test(x))return x.slice(0,7);
+  const k=MS.indexOf(x.slice(0,3));return k>=0&&/^[a-z]{3}\/\d{2}/.test(x)?"20"+x.slice(4,6)+"-"+String(k+1).padStart(2,"0"):null};
+function filtraTr(t){if(!Array.isArray(t.x)||!t.x.length)return t;const ym=t.x.map(ymLab);if(ym.some(v=>v==null))return t;
+  const k=ym.map(noPer),f=a=>Array.isArray(a)&&a.length==k.length?a.filter((_,i)=>k[i]):a,u={...t,x:f(t.x),y:f(t.y),text:f(t.text),customdata:f(t.customdata)};
+  if(t.marker)u.marker={...t.marker,color:f(t.marker.color),size:f(t.marker.size)};return u}
+const plot=(id,d,l)=>{if(l&&l.xaxis&&l.xaxis.categoryarray)l.xaxis={...l.xaxis,categoryarray:l.xaxis.categoryarray.filter(x=>{const y=ymLab(x);return y==null||noPer(y)})};
+  return Plotly.newPlot(id,d.map(filtraTr),l,{displayModeBar:false,responsive:true})};
+// fechar/abrir: clique no titulo; lembra o que ficou fechado neste navegador
+let FECH={};try{FECH=JSON.parse(localStorage.getItem("fechados")||"{}")}catch(e){}
+const chaveCx=e=>(e.querySelector(":scope>h2,:scope>.tt")||{}).textContent||"";
+const aplicaFechados=r=>r.querySelectorAll(".cx,.bx").forEach(e=>e.classList.toggle("fechado",!!FECH[chaveCx(e)]));
+document.addEventListener("click",ev=>{const t=ev.target.closest(".cx>h2,.bx>.tt");if(!t)return;const e=t.parentElement,fe=e.classList.toggle("fechado");
+  FECH[chaveCx(e)]=fe||undefined;try{localStorage.setItem("fechados",JSON.stringify(FECH))}catch(x){}
+  if(!fe)e.querySelectorAll(".js-plotly-plot").forEach(p=>Plotly.Plots.resize(p))});
 const cls=v=>v==null?"":v>=0?"pos":"neg";
 $("#hsub").textContent=`Gerado em ${D.gerado} • ${D.fundos.length} fundos (${D.fundos.filter(f=>f.nosso).length} nossos) • retorno até ${mesBR(D.ult_mes_completo)}`;
 const ABAS=[["a_geral","Visão geral"],["a_fundo","Fundo"],["a_perf","Performance de ativos"],["a_peers","Exposições vs. peers"]];
-$("#nav").innerHTML=ABAS.map(a=>`<a data-a="${a[0]}">${a[1]}</a>`).join("");
+$("#nav").innerHTML=ABAS.map(a=>`<a data-a="${a[0]}">${a[1]}</a>`).join("")+`<span class="per">Período <select id="per_de"></select> até <select id="per_ate"></select></span>`;
+["#per_de","#per_ate"].forEach((q,j)=>{$(q).innerHTML=MESES_P.map(m=>`<option value="${m}">${mesBR(m)}</option>`).join("");$(q).value=PER[j];
+  $(q).onchange=()=>{let a=$("#per_de").value,b=$("#per_ate").value;if(a>b){if(j)a=b;else b=a;$("#per_de").value=a;$("#per_ate").value=b}PER=[a,b];
+    const ab_=ULT_DET&&ULT_DET[0].isConnected&&ULT_DET[0].nextElementSibling?.classList.contains("det")?ULT_DET:null,tb=ab_&&ab_[0].closest("table")?.id;
+    geral();fundo();if(ab_){const t=tb&&document.querySelector(`#${tb} tr.cl[data-ch="${CSS.escape(ab_[1])}"]`)||(ab_[0].isConnected?ab_[0]:null);
+      if(t){if(t.nextElementSibling?.classList.contains("det"))t.nextElementSibling.remove();detalheAtivo(t,...ab_.slice(1))}}}});
+let ULT_DET=null;
 const vai=a=>{document.querySelectorAll("nav a").forEach(x=>x.classList.toggle("on",x.dataset.a==a));document.querySelectorAll(".aba").forEach(x=>x.classList.toggle("on",x.id==a));history.replaceState(null,"","#"+a);window.dispatchEvent(new Event("resize"))};
 document.querySelectorAll("nav a").forEach(x=>x.onclick=()=>vai(x.dataset.a));
 const abreFundo=id=>{$("#f_sel").value=id;fundo();vai("a_fundo");scrollTo(0,0)};
 // ---------- retorno em janelas
 const meses=Object.keys(D.cdi).sort().filter(m=>m<=D.ult_mes_completo), ultM=meses[meses.length-1];
-function acum(f,n){const ms=meses.slice(-n);let r=1,c=1,k=0;for(const m of ms){if(f.ret[m]==null)continue;r*=1+f.ret[m]/100;c*=1+D.cdi[m]/100;k++}return k<ms.length*.8?null:[(r-1)*100,(c-1)*100]}
-function vol(f,n){const v=meses.slice(-n).map(m=>f.ret[m]).filter(x=>x!=null);if(v.length<n*.8)return null;const mu=v.reduce((a,b)=>a+b)/v.length;return Math.sqrt(v.reduce((a,b)=>a+(b-mu)**2,0)/(v.length-1))*Math.sqrt(12)}
+const corte=f=>f.abertos[f.abertos.length-1]||"",mf=f=>meses.filter(m=>m<=corte(f));
+const ytd=f=>{const x=mf(f),u=x[x.length-1]||"";return x.filter(m=>m.slice(0,4)==u.slice(0,4)).length};
+function acumP(f){const ms=mf(f).filter(noPer);let r=1,c=1,k=0;for(const m of ms){if(f.ret[m]==null)continue;r*=1+f.ret[m]/100;c*=1+D.cdi[m]/100;k++}return !ms.length||k<ms.length*.8?null:[(r-1)*100,(c-1)*100]}
+function acum(f,n){const ms=mf(f).slice(-n);let r=1,c=1,k=0;for(const m of ms){if(f.ret[m]==null)continue;r*=1+f.ret[m]/100;c*=1+D.cdi[m]/100;k++}return k<ms.length*.8?null:[(r-1)*100,(c-1)*100]}
+function vol(f,n){const v=mf(f).slice(-n).map(m=>f.ret[m]).filter(x=>x!=null);if(v.length<n*.8)return null;const mu=v.reduce((a,b)=>a+b)/v.length;return Math.sqrt(v.reduce((a,b)=>a+(b-mu)**2,0)/(v.length-1))*Math.sqrt(12)}
 const pcdi=(f,n)=>{const a=acum(f,n);return a&&a[1]?a[0]/a[1]*100:null};
 const ytdN=meses.filter(m=>m.slice(0,4)==ultM.slice(0,4)).length;
 const ultAb=f=>{const m=f.abertos[f.abertos.length-1];return f.carteira.find(c=>c.m==m)};
@@ -2486,12 +2541,12 @@ document.querySelectorAll("#g_chips .chip").forEach(e=>e.onclick=()=>{gFil=e.dat
 $("#g_busca").oninput=geral;
 function geral(){const b=$("#g_busca").value.toLowerCase();
   const L=ordena(D.fundos.filter(f=>(gFil=="Todos"||(gFil=="Nossos")==f.nosso)&&f.nome.toLowerCase().includes(b)).map(f=>{const c=ultAb(f);
-    return{f,nome:f.nome,pl:f.pl,ab:f.abertos[f.abertos.length-1]||"",m1:pcdi(f,1),m3:pcdi(f,3),ytd:pcdi(f,ytdN),r12:pcdi(f,12),r24:pcdi(f,24),vol:vol(f,12),sp:c?c.sp:null,du:c?c.du:null,cats:topCats(c)}}),gOrd);
-  const C=[["nome","Fundo","l"],["pl","PL (R$ mm)"],["ab","Carteira aberta"],["m1",`Mês (${mesBR(ultM)})`],["m3","3 meses"],["ytd","No ano"],["r12","12 meses"],["r24","24 meses"],["vol","Vol 12m"],["sp","Spread CDI+"],["du","Duration"],["cats","Maiores categorias","l"]];
+    return{f,nome:f.nome,pl:f.pl,ab:f.abertos[f.abertos.length-1]||"",m1:pcdi(f,1),m3:pcdi(f,3),ytd:pcdi(f,ytd(f)),r12:pcdi(f,12),r24:pcdi(f,24),rp:(a=>a&&a[1]?a[0]/a[1]*100:null)(acumP(f)),vol:vol(f,12),sp:c?c.sp:null,du:c?c.du:null,cats:topCats(c)}}),gOrd);
+  const C=[["nome","Fundo","l"],["pl","PL (R$ mm)"],["ab","Carteira aberta"],["m1","Último mês"],["m3","3 meses"],["ytd","No ano"],["r12","12 meses"],["r24","24 meses"],["rp",`${mesBR(PER[0])}–${mesBR(PER[1])}`],["vol","Vol 12m"],["sp","Spread CDI+"],["du","Duration"],["cats","Maiores categorias","l"]];
   $("#g_tab").innerHTML=th(C,gOrd)+L.map(r=>`<tr class="${r.f.nosso?"nosso":""}">`+C.map(c=>{const v=r[c[0]];
     if(c[0]=="nome")return`<td class="l"><span class="ponto" style="background:${cor(r.f)}"></span><span class="lk" data-id="${r.f.id}">${esc(v)}</span>${r.f.nosso?' <span class="tag">NOSSO</span>':""}</td>`;
     if(c[0]=="ab")return`<td>${mesBR(v)}</td>`;if(c[0]=="cats")return`<td class="l mut">${v}</td>`;if(c[0]=="pl")return`<td>${br(v,0)}</td>`;
-    if(["m1","m3","ytd","r12","r24"].includes(c[0]))return`<td class="${v==null?"":v>=100?"pos":"neg"}">${v==null?"—":br(v,0)+"%"}</td>`;return`<td>${br(v)}</td>`}).join("")+"</tr>").join("");
+    if(["m1","m3","ytd","r12","r24","rp"].includes(c[0]))return`<td class="${v==null?"":v>=100?"pos":"neg"}">${v==null?"—":br(v,0)+"%"}</td>`;return`<td>${br(v)}</td>`}).join("")+"</tr>").join("");
   cabec($("#g_tab"),C,gOrd,geral);$("#g_tab").querySelectorAll(".lk").forEach(e=>e.onclick=()=>abreFundo(e.dataset.id));
   const pts=L.filter(r=>r.vol!=null&&acum(r.f,12)), cdi12=meses.slice(-12).reduce((a,m)=>a*(1+D.cdi[m]/100),1)*100-100;
   plot("g_rr",[false,true].map(n=>{const p=pts.filter(r=>r.f.nosso==n);return{x:p.map(r=>r.vol),y:p.map(r=>acum(r.f,12)[0]),text:p.map(r=>r.nome),mode:"markers",name:n?"nossos":"peers",
@@ -2502,23 +2557,30 @@ function geral(){const b=$("#g_busca").value.toLowerCase();
     marker:{color:n?"#eb6834":"#9aa0a6",size:n?12:9,line:{color:"#fff",width:1}},hovertemplate:"%{text}<br>CDI+ %{y:.2f}%<br>duration %{x:.2f}<extra></extra>"}}),LAY({xaxis:{title:{text:"duration (anos)"}},yaxis:{title:{text:"spread CDI+ (% a.a.)"}}}))}
 // ---------- detalhe de um ativo (clique em qualquer tabela de ativos)
 let detN=0;
+const MERCADO=new Set(["Ações","ETF","FII","FIAGRO","FIP","Fundos offshore","Cotas de fundos","Outras aplicações","BDR"]);
+const PAL_N=["#E69F00","#0072B2","#009E73","#D55E00","#56B4E9","#CC79A7"],ORD_N=Object.fromEntries(D.fundos.filter(f=>f.nosso).map((f,i)=>[f.id,i]));
+const corNosso=id=>PAL_N[(ORD_N[id]??0)%PAL_N.length],dashNosso=id=>["solid","dash","dot"][Math.floor((ORD_N[id]??0)/PAL_N.length)%3];
 const FONTE={Q:"preço do fundo + juros/amortização pagos (informe da securitizadora, CVM)",O:"retorno oficial da série ao par (informe da securitizadora, CVM)",S:"preço do fundo + juros/amortização pagos (PU par do SND)",P:"preço informado pelo fundo",E:"carrego + curva (sem preço observável no mês)",
  F:"FIDC: rentabilidade oficial da série (CVM)",T:"Tesouro + cupom",U:"preço em R$ (sem hedge)",M:"preço de mercado",C:"CDI",
  A:"carrego (CDI + spread): o preço caiu forte — amortização ou perda? o fluxo deste papel não é público, confira"};
 function detalheAtivo(tr,ch,ncol,ctx){const prox=tr.nextElementSibling;if(prox&&prox.classList.contains("det")){prox.remove();return}
-  document.querySelectorAll("tr.det").forEach(x=>x.remove());const d=D.det[ch],p=PERF[ch]||{},o=OVL[ch]||{},id="dt"+(++detN);
+  ULT_DET=[tr,ch,ncol,ctx];document.querySelectorAll("tr.det").forEach(x=>x.remove());const d=D.det[ch],p=PERF[ch]||{},o=OVL[ch]||{},id="dt"+(++detN);
   const n=document.createElement("tr");n.className="det";tr.after(n);
   if(!d){n.innerHTML=`<td colspan="${ncol}">Sem histórico detalhado para este ativo no arquivo (fica só para os ${Object.keys(D.det).length} mais relevantes).</td>`;return}
-  const w=p.w12||[],u3=p.ult3||[];
+  const w=p.w12||[],u3=p.ult3||[],cat=d.cat||p.categoria||o.categoria||"",h=d.h,an=d.anb;
+  const vna=["CRI","CRA"].includes(cat),temPar=h&&h.par.some(x=>x!=null),temSp=h&&h.sp.some(x=>x!=null),
+    temTx=an&&an.tx.some(x=>x!=null),temAp=an&&an.par.some(x=>x!=null),verSp=!MERCADO.has(cat)&&cat!="FIDC"&&(temSp||temPar),verAn=temTx||temAp;
+  const tSp=(temSp?(d.ind&&d.ind!="DI"?"Spread (CDI+ equivalente)":"Spread CDI+"):"")+(temSp&&temPar?" e ":"")+(temPar?(vna?"% do VNA":"% do PU par"):"");
   const k=[["Último mês",u3[2]==null?"—":br(u3[2])+"%",mesBR(D.meses[D.meses.length-1])],["3 meses",u3.length&&u3.every(x=>x!=null)?br((u3.reduce((a,x)=>a*(1+x/100),1)-1)*100)+"%":"—",""],
     ["12 meses",w[0]==null?"—":br(w[0])+"%",w[1]==null?"":br(w[1],0)+"% do CDI"],["Vol / Sharpe 12m",(w[2]==null?"—":br(w[2])+"%")+" / "+(w[3]==null?"—":br(w[3])),""],
-    ["Spread / duration",(p.spread??o.spread)==null?"—":"CDI+ "+br(p.spread??o.spread),(p.duration??o.duration)==null?"":br(p.duration??o.duration)+" anos"],
+    ...(MERCADO.has(cat)?[]:[[cat=="FIDC"?"Spread realizado (6m)":"Spread / duration",(p.spread??o.spread)==null?"—":"CDI+ "+br(p.spread??o.spread),cat=="FIDC"||(p.duration??o.duration)==null?"":br(p.duration??o.duration)+" anos"]]),
     ["Fundos com o ativo",(p.n_hoje??o.n??"—")+"",`já esteve em ${p.n_ever??"—"} • ${(p.temos??o.temos)?"nós temos":"não temos"}`]];
   n.innerHTML=`<td colspan="${ncol}"><div class="kpis">${k.map(x=>`<div class="k"><div class="r">${x[0]}</div><div class="v">${x[1]}</div><div class="x">${x[2]}</div></div>`).join("")}</div>
-   <div class="g2"><div><b>Retorno total mensal do ativo × CDI</b><div id="${id}a" style="height:270px"></div></div><div><b>Curva acumulada: ativo × CDI</b><div id="${id}b" style="height:270px"></div></div>
-   <div><b>% do PL</b><div id="${id}c" style="height:260px"></div></div><div><b>Spread CDI+ e % do PU par</b><div id="${id}d" style="height:260px"></div></div>
-   <div><b>ANBIMA: taxa indicativa e % do PU par (diário)</b><div id="${id}e" style="height:260px"></div></div><div class="mini" id="${id}f" style="align-self:center;line-height:1.6"></div></div></td>`;
-  const M=D.meses,R=d.r||[],S=d.s||"",idx=M.map((m,i)=>i).filter(i=>R[i]!=null);if(!idx.length){$("#"+id+"a").innerHTML=$("#"+id+"b").innerHTML="<div class=\"mini\">Sem retorno mensal medido (ativo novo ou só em meses sem carteira anterior).</div>"}
+   <div class="g2"><div class="bx"><b class="tt">Retorno total mensal do ativo × CDI</b><div id="${id}a" style="height:270px"></div></div><div class="bx"><b class="tt">Curva acumulada: ativo × CDI</b><div id="${id}b" style="height:270px"></div></div>
+   <div class="bx"><b class="tt">% do PL</b><div id="${id}c" style="height:260px"></div></div>${verSp?`<div class="bx"><b class="tt">${tSp}</b><div id="${id}d" style="height:260px"></div></div>`:""}
+   ${verAn?`<div class="bx"><b class="tt">ANBIMA: taxa indicativa e % do PU par (diário)</b><div id="${id}e" style="height:260px"></div></div>`:""}<div class="mini" id="${id}f" style="align-self:center;line-height:1.6"></div></div></td>`;
+  aplicaFechados(n);
+  const M=D.meses,R=d.r||[],S=d.s||"",idx=M.map((m,i)=>i).filter(i=>R[i]!=null&&noPer(M[i]));if(!idx.length){$("#"+id+"a").innerHTML=$("#"+id+"b").innerHTML="<div class=\"mini\">Sem retorno mensal medido (ativo novo ou só em meses sem carteira anterior).</div>"}
   const EV=d.ev||{},fonte=i=>(FONTE[S[i]]||"—")+(EV[i]!=null?` (queda de preço observada: ${br(EV[i])}%)`:""),est=idx.filter(i=>S[i]=="E"||S[i]=="A").length,nev=Object.keys(EV).length;
   if(idx.length)plot(id+"a",[{x:idx.map(i=>mesBR(M[i])),y:idx.map(i=>D.cdi[M[i]]),type:"bar",name:"CDI",marker:{color:"#c9cdd3"},hovertemplate:"CDI %{x}: %{y:.2f}%<extra></extra>"},
     {x:idx.map(i=>mesBR(M[i])),y:idx.map(i=>R[i]),type:"bar",name:"ativo",marker:{color:idx.map(i=>S[i]=="A"?"#eda100":S[i]=="E"?"#9ec5e8":R[i]>=0?"#1f5f87":"#b42318")},
@@ -2527,20 +2589,18 @@ function detalheAtivo(tr,ch,ncol,ctx){const prox=tr.nextElementSibling;if(prox&&
   if(idx.length)plot(id+"b",[{x:idx.map(i=>mesBR(M[i])),y:ca,name:"ativo",mode:"lines",line:{color:"#1f5f87",width:2.5},hovertemplate:"ativo: %{y:.1f}<extra>%{x}</extra>"},
     {x:idx.map(i=>mesBR(M[i])),y:cc,name:"CDI",mode:"lines",line:{color:"#111",dash:"dash"},hovertemplate:"CDI: %{y:.1f}<extra>%{x}</extra>"}],LAY({yaxis:{title:{text:"base 100"}},xaxis:{type:"category"}}));
   const ent=Object.entries(d.pl),meu=ent.filter(([fid])=>fid==ctx||F[fid].nosso),tl=meu.map(([fid,arr])=>({x:arr.map(q=>mesBR(M[q[0]])),y:arr.map(q=>q[1]),name:F[fid].nome+(fid==ctx&&!F[fid].nosso?" (este fundo)":""),
-    mode:"lines+markers",line:{color:fid==ctx&&!F[fid].nosso?"#111":"#eb6834",width:2.5},marker:{size:4},hovertemplate:`${esc(F[fid].nome)}: %{y:.2f}%<extra>%{x}</extra>`}));
+    mode:"lines+markers",line:{color:fid==ctx&&!F[fid].nosso?"#111":corNosso(fid),width:2.5,dash:fid==ctx&&!F[fid].nosso?"solid":dashNosso(fid)},marker:{size:5},hovertemplate:`${esc(F[fid].nome)}: %{y:.2f}%<extra>%{x}</extra>`}));
   if(!ctx||F[ctx].nosso){const pe=ent.filter(([fid])=>!F[fid].nosso),mm={};pe.forEach(([,arr])=>arr.forEach(q=>{(mm[q[0]]=mm[q[0]]||[]).push(q[1])}));
     const ks=Object.keys(mm).map(Number).sort((x,y)=>x-y);if(ks.length)tl.push({x:ks.map(q=>mesBR(M[q])),y:ks.map(q=>mm[q].reduce((x,y)=>x+y)/mm[q].length),name:"média dos peers que têm",mode:"lines",line:{color:"#9aa0a6",width:2,dash:"dot"},
       text:ks.map(q=>mm[q].length+" peers"),hovertemplate:"média peers: %{y:.2f}% (%{text})<extra>%{x}</extra>"})}
   if(tl.length)plot(id+"c",tl,LAY({yaxis:{title:{text:"% do PL"}},xaxis:{type:"category",categoryorder:"array",categoryarray:M.map(mesBR)}}));else $("#"+id+"c").innerHTML='<div class="mini">Nem este fundo nem os nossos têm o ativo.</div>';
-  const h=d.h,temPar=h&&h.par.some(x=>x!=null);
-  if(h)plot(id+"d",[{x:h.m.map(i=>mesBR(M[i])),y:h.sp,name:"spread CDI+ (esq.)",mode:"lines+markers",line:{color:"#eb6834",width:2}},
-    ...(temPar?[{x:h.m.map(i=>mesBR(M[i])),y:h.par,name:"% do PU par (dir.)",mode:"lines+markers",line:{color:"#2a78d6",width:2,dash:"dot"},yaxis:"y2"}]:[])],
-    LAY({yaxis:{title:{text:"spread CDI+ (% a.a.)"}},yaxis2:{title:{text:"% do PU par"},overlaying:"y",side:"right"},xaxis:{type:"category"},margin:{l:56,r:60,t:10,b:40}}));
-  const an=d.anb,temTx=an&&an.tx.some(x=>x!=null),temAp=an&&an.par.some(x=>x!=null);
-  if(an&&(temTx||temAp))plot(id+"e",[...(temTx?[{x:an.d,y:an.tx,name:`taxa indicativa (${an.ind}) (esq.)`,mode:"lines+markers",line:{color:"#1f5f87",width:2}}]:[]),
+  const nPar=vna?"% do VNA":"% do PU par",so=temSp&&!temPar;
+  if(verSp)plot(id+"d",[...(temSp?[{x:h.m.map(i=>mesBR(M[i])),y:h.sp,name:"spread"+(temPar?" (esq.)":""),mode:"lines+markers",line:{color:"#eb6834",width:2},hovertemplate:"spread %{y:.2f}%<extra>%{x}</extra>"}]:[]),
+    ...(temPar?[{x:h.m.map(i=>mesBR(M[i])),y:h.par,name:nPar+(temSp?" (dir.)":""),mode:"lines+markers",line:{color:"#2a78d6",width:2,dash:"dot"},yaxis:temSp?"y2":"y",hovertemplate:nPar+" %{y:.1f}<extra>%{x}</extra>"}]:[])],
+    LAY({yaxis:{title:{text:temSp?"% a.a.":nPar}},...(temSp&&temPar?{yaxis2:{title:{text:nPar},overlaying:"y",side:"right"}}:{}),xaxis:{type:"category"},margin:{l:56,r:60,t:10,b:40}}));
+  if(verAn)plot(id+"e",[...(temTx?[{x:an.d,y:an.tx,name:`taxa indicativa (${an.ind}) (esq.)`,mode:"lines+markers",line:{color:"#1f5f87",width:2}}]:[]),
     ...(temAp?[{x:an.d,y:an.par,name:"% do PU par (dir.)",mode:"lines",line:{color:"#eb6834",width:2,dash:"dot"},yaxis:"y2"}]:[])],
     LAY({yaxis:{title:{text:"taxa (%)"}},yaxis2:{title:{text:"% PU par"},overlaying:"y",side:"right"},margin:{l:56,r:60,t:10,b:40}}));
-  else $("#"+id+"e").innerHTML=`<div class="mini">Sem marcação ANBIMA.</div>`;
   $("#"+id+"f").innerHTML=nev?`<b style="color:#b26b00">${nev} mês(es) com queda forte de preço (barra amarela)</b>`:""}
 // ---------- fundo
 $("#f_sel").innerHTML=[...D.fundos].sort((a,b)=>(b.nosso-a.nosso)||a.nome.localeCompare(b.nome)).map(f=>`<option value="${f.id}">${f.nosso?"★ ":""}${esc(f.nome)}</option>`).join("");
@@ -2549,7 +2609,7 @@ const tOrd={k:"ret",asc:false};document.querySelectorAll("#a_fundo .chip[data-m]
 $("#f_topcat").oninput=topFundo;
 function fundo(){const f=F[$("#f_sel").value],c=ultAb(f);
   $("#f_info").innerHTML=`${f.cnpj} • última CDA ${mesBR(f.carteira.length?f.carteira[f.carteira.length-1].m:null)} • última carteira aberta ${mesBR(f.abertos[f.abertos.length-1])} • cota até ${diaBR(f.ult_cota)}${f.distribui?" • distribui rendimentos (retorno total)":""}`;
-  const k=[["PL","R$ "+br(f.pl,0)+" mm",""],["12 meses",pcdi(f,12)==null?"—":br(pcdi(f,12),0)+"% do CDI",acum(f,12)?br(acum(f,12)[0])+"%":""],["No ano",pcdi(f,ytdN)==null?"—":br(pcdi(f,ytdN),0)+"% do CDI",""],
+  const k=[["PL","R$ "+br(f.pl,0)+" mm",""],["12 meses",pcdi(f,12)==null?"—":br(pcdi(f,12),0)+"% do CDI",acum(f,12)?br(acum(f,12)[0])+"%":""],["No ano",pcdi(f,ytd(f))==null?"—":br(pcdi(f,ytd(f)),0)+"% do CDI",""],
     ["Spread carteira",c?"CDI+ "+br(c.sp):"—",c?mesBR(c.m):""],["Duration",c?br(c.du)+" anos":"—",""],["Vol 12m",vol(f,12)==null?"—":br(vol(f,12))+"%",""]];
   $("#f_kpis").innerHTML=k.map(x=>`<div class="k"><div class="r">${x[0]}</div><div class="v">${x[1]}</div><div class="x">${x[2]}</div></div>`).join("");
   const ab=f.carteira.filter(x=>x.ab), cats=[...new Set(ab.flatMap(x=>Object.keys(x.cats)))].filter(k=>k!="Ajuste");
@@ -2558,8 +2618,8 @@ function fundo(){const f=F[$("#f_sel").value],c=ultAb(f);
     LAYR({barmode:"stack",bargap:0,yaxis:{ticksuffix:"%",title:{text:"% do PL"}},xaxis:{type:"category"}}));
   const op=$("#f_sdcat .op");op.innerHTML=["Total",...cats].map((k,i)=>`<label><input type="checkbox" value="${esc(k)}"${i==0?" checked":""}> ${k=="Total"?"<b>Carteira total</b>":esc(k)}</label>`).join("");
   op.querySelectorAll("input").forEach(x=>x.onchange=spdur);spdur();
-  const ms=meses.slice(-24), pre=new Set((D.preench||{})[f.id]||[]), rot=m=>mesBR(m)+(pre.has(m)?"*":""), cr=Object.keys(f.ret_cats).filter(k=>k!="Confidencial"||ms.some(m=>{const i=f.ret_meses.indexOf(m);return i>=0&&Math.abs(f.ret_cats[k][i]||0)>.001}));
-  const tr=cr.map(k=>({x:ms.map(rot),y:ms.map(m=>{const i=f.ret_meses.indexOf(m);return i<0?null:f.ret_cats[k][i]}),name:k,type:"bar",marker:{color:corCat(k)},hovertemplate:`${k}: %{y:.3f} pp<extra>%{x}</extra>`}));
+  const ms=mf(f), pre=new Set((D.preench||{})[f.id]||[]), rot=mesBR, cr=Object.keys(f.ret_cats).filter(k=>k!="Confidencial"||ms.some(m=>{const i=f.ret_meses.indexOf(m);return i>=0&&Math.abs(f.ret_cats[k][i]||0)>.001}));
+  const tr=cr.map(k=>({x:ms.map(rot),y:ms.map(m=>{const i=f.ret_meses.indexOf(m);return i<0||pre.has(m)?null:f.ret_cats[k][i]}),name:k,type:"bar",marker:{color:corCat(k)},hovertemplate:`${k}: %{y:.3f} pp<extra>%{x}</extra>`}));
   tr.push({x:ms.map(rot),y:ms.map(m=>f.ret[m]),name:"retorno da cota",mode:"lines+markers",line:{color:"#eb6834",width:3},hovertemplate:"cota: %{y:.2f}%<extra>%{x}</extra>"},
     {x:ms.map(rot),y:ms.map(m=>D.cdi[m]),name:"CDI",mode:"lines",line:{color:"#111",dash:"dash"},hovertemplate:"CDI: %{y:.2f}%<extra>%{x}</extra>"});
   plot("f_ret",tr,LAYR({barmode:"relative",yaxis:{ticksuffix:"%",title:{text:"% no mês"}}}));
@@ -2624,7 +2684,7 @@ function peers(){const c=$("#p_cat").value,mn=+$("#p_min").value,so=$("#p_so").c
   const G=D.grupos.filter(g=>(!c||g.categorias.includes(c))&&g.grupo.toLowerCase().includes(b)).map(g=>({...g,dif:(g.peers_perc||0)-(g.nossos_perc||0)})).sort((a,x)=>x.dif-a.dif).slice(0,60);
   $("#p_gru").innerHTML="<tr><th class='l'>Grupo</th><th class='l'>Categorias</th><th>Peers: % PL médio</th><th>Nossos: % PL médio</th><th>Diferença</th><th>Nº peers</th><th>Nº nossos</th><th>R$ mm (peers)</th></tr>"+
    G.map(g=>`<tr><td class="l">${esc(g.grupo)}</td><td class="l mut">${esc(g.categorias.join(", "))}</td><td>${br(g.peers_perc)}</td><td>${br(g.nossos_perc)}</td><td class="${g.dif>0?"neg":"pos"}"><b>${g.dif>0?"+":""}${br(g.dif)}</b></td><td>${g.n_peers}</td><td>${g.n_nossos}</td><td>${br(g.rs_peers,1)}</td></tr>`).join("")}
-geral();fundo();perf();peers();vai(ABAS.some(a=>"#"+a[0]==location.hash)?location.hash.slice(1):"a_geral");
+aplicaFechados(document);geral();fundo();perf();peers();vai(ABAS.some(a=>"#"+a[0]==location.hash)?location.hash.slice(1):"a_geral");
 </script></body></html>
 '''   # painel em HTML (arquivo unico)
 

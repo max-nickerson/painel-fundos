@@ -21,7 +21,8 @@ Debêntures: preço do fundo + pagamento pelo PU par do SND. FIDC: rentabilidade
 CRI/CRA: fluxo do informe mensal das securitizadoras (CVM) — (preço do fundo + juros/amortização pagos por certificado) / preço anterior. A carteira é casada com a série pelo ISIN/código CETIP ou CNPJ + vencimento (desempate pelo PU do fundo). Sem série casada, VNA que cai sem pagamento informado ou mês ainda sem informe (até 30 dias): carrego + curva.
 NC/CCB: o fluxo não é público; preço abaixo do esperado = pagamento → carrego + curva; queda forte que não volta fica marcada (amortização ou perda?).
 Conferência com dados oficiais: soma das categorias = cota CVM em 100% dos fundo-meses (resíduo mediano 0,08 p.p./mês); séries 100% CDI do informe = CDI (erro < 0,05 p.p. em 92% dos meses).
-Meses com a carteira confidencial usam a última carteira aberta (marcados com *).
+Só dado de carteira aberta: o corte de cada fundo é a última carteira aberta, e posição estimada de carteira escondida não entra no retorno dos ativos.
+Clique no título de um gráfico ou tabela para fechar/abrir; o período (de/até, ou um mês só) fica na barra das abas.
 Point in time: a CVM só guarda a última versão de cada arquivo (carteiras republicadas; 8% dos informes de securitizadora reapresentados). O painel arquiva cada versão baixada (`rec/versoes`, `securit/versoes`) e `securitizadoras(asof=...)` usa só o que já tinha sido entregue na data.
 
 Só entra carteira pública: um mês conta como aberto quando a parte confidencial é menor que 5% do PL (a CVM permite esconder posições por até ~90 dias).
