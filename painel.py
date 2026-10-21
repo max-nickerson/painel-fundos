@@ -2411,38 +2411,37 @@ details.ms .op{position:absolute;z-index:9;background:#fff;border:1px solid var(
 details.ms label{display:block;padding:2px 0;white-space:nowrap}.mini{font-size:11px;color:var(--s);margin:4px 0 0}
 </style></head><body>
 <header><div><h1>Painel de Fundos — nossos × peers</h1><div class="s" id="hsub"></div></div>
-<div class="s">Só dado público: carteira (CDA/CVM) nos meses com menos de <b id="hlim"></b>% confidencial • retorno pela cota diária da CVM • ANBIMA • SND</div></header>
+</header>
 <nav id="nav"></nav>
 <main>
 <section class="aba" id="a_geral">
   <div class="ctl"><span id="g_chips"></span><input id="g_busca" placeholder="buscar fundo"></div>
-  <div class="cx"><h2>Todos os fundos</h2><div class="sub">Retorno em % do CDI • spread CDI+ e duration da última carteira aberta • clique no fundo para abrir</div><div class="scroll"><table class="t" id="g_tab"></table></div></div>
-  <div class="g2"><div class="cx"><h2>Retorno × risco (12 meses)</h2><div class="sub">Linha tracejada: CDI do período</div><div id="g_rr" style="height:380px"></div></div>
-    <div class="cx"><h2>Spread × duration (última carteira aberta)</h2><div class="sub">&nbsp;</div><div id="g_sd" style="height:380px"></div></div></div>
+  <div class="cx"><h2>Todos os fundos</h2><div class="scroll"><table class="t" id="g_tab"></table></div></div>
+  <div class="g2"><div class="cx"><h2>Retorno × risco (12 meses)</h2><div id="g_rr" style="height:380px"></div></div>
+    <div class="cx"><h2>Spread × duration (última carteira aberta)</h2><div id="g_sd" style="height:380px"></div></div></div>
 </section>
 <section class="aba" id="a_fundo">
   <div class="ctl"><select id="f_sel" style="min-width:320px"></select><span id="f_info" class="sub"></span></div>
   <div class="kpis" id="f_kpis"></div>
   <div class="cx"><h2>Alocação por categoria (% do PL) — só meses abertos</h2><div id="f_aloc" style="height:360px"></div></div>
-  <div class="cx"><h2>Spread CDI+ e duration da carteira</h2><div class="ctl"><details class="ms" id="f_sdcat"><summary>Categorias ▾</summary><div class="op"></div></details>
-    <span class="sub">Spread CDI+: linhas cheias, eixo esquerdo (% a.a.) • duration: linhas tracejadas em outra cor, eixo direito (anos)</span></div><div id="f_sd" style="height:360px"></div></div>
-  <div class="cx"><h2>Retorno mensal × CDI e de onde veio (por categoria)</h2><div class="sub">Atribuição estimada: retorno de cada ativo × peso; hedges e resíduo distribuídos pelo peso • meses com a carteira escondida (confidencial) usam a última carteira aberta e ficam marcados com * • passe o mouse nas barras</div><div id="f_ret" style="height:380px"></div></div>
+  <div class="cx"><h2>Spread CDI+ e duration da carteira</h2><div class="ctl"><details class="ms" id="f_sdcat"><summary>Categorias ▾</summary><div class="op"></div></details></div><div id="f_sd" style="height:360px"></div></div>
+  <div class="cx"><h2>Retorno mensal × CDI e de onde veio (por categoria)</h2><div id="f_ret" style="height:380px"></div></div>
   <div class="cx"><h2>Carteira</h2><div class="ctl"><select id="f_mes"></select><select id="f_cat"></select><input id="f_busca" placeholder="buscar ativo/emissor"></div><div class="scroll"><table class="t" id="f_tab"></table></div></div>
-  <div class="cx"><h2>Melhores ativos do fundo — últimos 12 meses</h2><div class="ctl"><span class="chip on" data-m="ret">Retorno do ativo</span><span class="chip" data-m="bps">Contribuição para o fundo (bps)</span><select id="f_topcat"></select><span class="sub">clique no título da coluna para ordenar (de novo inverte) • clique no ativo para o histórico</span></div><div class="scroll"><table class="t" id="f_top"></table></div></div>
+  <div class="cx"><h2>Melhores ativos do fundo — últimos 12 meses</h2><div class="ctl"><span class="chip on" data-m="ret">Retorno do ativo</span><span class="chip" data-m="bps">Contribuição para o fundo (bps)</span><select id="f_topcat"></select></div><div class="scroll"><table class="t" id="f_top"></table></div></div>
   <div class="cx"><h2>Mudanças na carteira</h2><div class="sub" id="f_mud_sub"></div><div class="g2"><div><b>Entradas e aumentos</b><table class="t" id="f_mud_up"></table></div><div><b>Saídas e reduções</b><table class="t" id="f_mud_dn"></table></div></div></div>
 </section>
 <section class="aba" id="a_perf">
   <div class="ctl"><select id="v_jan"><option value="w12">Últimos 12 meses</option><option value="w36">Últimos 36 meses</option><option value="wt">Desde o início</option></select>
     <select id="v_cat"></select><label>em pelo menos <select id="v_min"><option>1</option><option selected>2</option><option>3</option><option>5</option><option>10</option></select> fundos</label>
     <label><input type="checkbox" id="v_nt"> só os que não temos</label><input id="v_busca" placeholder="buscar ativo/emissor/grupo"></div>
-  <div class="cx"><h2>Performance de ativos — todas as carteiras, todos os meses</h2><div class="sub">Retorno mensal do ativo = contribuição ÷ peso, média ponderada entre os fundos que o têm • Sharpe = excesso sobre o CDI ÷ vol (mín. 6 meses) • nº de fundos e % do PL na última carteira aberta • clique para o histórico (peso nos fundos, spread, PU, ANBIMA, últimos negócios B3)</div>
+  <div class="cx"><h2>Performance de ativos — todas as carteiras, todos os meses</h2>
     <div class="scroll"><table class="t" id="v_tab"></table></div></div>
 </section>
 <section class="aba" id="a_peers">
   <div class="ctl"><select id="p_cat"></select><label>em pelo menos <select id="p_min"><option>1</option><option selected>2</option><option>3</option><option>5</option></select> peers</label>
     <label><input type="checkbox" id="p_so"> incluir o que já temos</label><label><input type="checkbox" id="p_gr"> só grupos sem exposição nossa</label><input id="p_busca" placeholder="buscar ativo/emissor/grupo"></div>
-  <div class="cx"><h2>Exposições dos peers ausentes nas nossas carteiras</h2><div class="sub">Última carteira aberta de cada fundo • % PL médio entre os peers que têm • R$ somado nos peers • "Nosso % no grupo" = % do PL médio dos nossos fundos no mesmo grupo econômico (podemos ter outra emissão do emissor) • sem caixa e títulos públicos • clique para o histórico</div><div class="scroll"><table class="t" id="p_tab"></table></div></div>
-  <div class="cx"><h2>Grupos econômicos: peso médio dos peers × nosso</h2><div class="sub">% do PL somado por grupo, médio por fundo • diferença positiva = peers mais expostos que nós</div><div class="scroll"><table class="t" id="p_gru"></table></div></div>
+  <div class="cx"><h2>Exposições dos peers ausentes nas nossas carteiras</h2><div class="scroll"><table class="t" id="p_tab"></table></div></div>
+  <div class="cx"><h2>Grupos econômicos: peso médio dos peers × nosso</h2><div class="scroll"><table class="t" id="p_gru"></table></div></div>
 </section>
 
 </main>
@@ -2463,7 +2462,7 @@ const LAY=x=>Object.assign({margin:{l:56,r:16,t:10,b:40},font:{size:11},legend:{
 const LAYR=x=>LAY(Object.assign({margin:{l:56,r:170,t:10,b:40},legend:{x:1.02,y:1,xanchor:"left",font:{size:10}}},x||{}));    // legenda ao lado: nunca em cima do grafico
 const plot=(id,d,l)=>Plotly.newPlot(id,d,l,{displayModeBar:false,responsive:true});
 const cls=v=>v==null?"":v>=0?"pos":"neg";
-$("#hsub").textContent=`Gerado em ${D.gerado} • ${D.fundos.length} fundos (${D.fundos.filter(f=>f.nosso).length} nossos) • retorno até ${mesBR(D.ult_mes_completo)}`;$("#hlim").textContent=D.limite_conf;
+$("#hsub").textContent=`Gerado em ${D.gerado} • ${D.fundos.length} fundos (${D.fundos.filter(f=>f.nosso).length} nossos) • retorno até ${mesBR(D.ult_mes_completo)}`;
 const ABAS=[["a_geral","Visão geral"],["a_fundo","Fundo"],["a_perf","Performance de ativos"],["a_peers","Exposições vs. peers"]];
 $("#nav").innerHTML=ABAS.map(a=>`<a data-a="${a[0]}">${a[1]}</a>`).join("");
 const vai=a=>{document.querySelectorAll("nav a").forEach(x=>x.classList.toggle("on",x.dataset.a==a));document.querySelectorAll(".aba").forEach(x=>x.classList.toggle("on",x.id==a));history.replaceState(null,"","#"+a);window.dispatchEvent(new Event("resize"))};
@@ -2516,8 +2515,8 @@ function detalheAtivo(tr,ch,ncol,ctx){const prox=tr.nextElementSibling;if(prox&&
     ["Spread / duration",(p.spread??o.spread)==null?"—":"CDI+ "+br(p.spread??o.spread),(p.duration??o.duration)==null?"":br(p.duration??o.duration)+" anos"],
     ["Fundos com o ativo",(p.n_hoje??o.n??"—")+"",`já esteve em ${p.n_ever??"—"} • ${(p.temos??o.temos)?"nós temos":"não temos"}`]];
   n.innerHTML=`<td colspan="${ncol}"><div class="kpis">${k.map(x=>`<div class="k"><div class="r">${x[0]}</div><div class="v">${x[1]}</div><div class="x">${x[2]}</div></div>`).join("")}</div>
-   <div class="g2"><div><b>Retorno total mensal do ativo × CDI</b><div id="${id}a" style="height:270px"></div></div><div><b>Curva acumulada: ativo × CDI</b> <span class="mini">(base 100, meses em que algum fundo tinha o ativo)</span><div id="${id}b" style="height:270px"></div></div>
-   <div><b>% do PL</b> <span class="mini" id="${id}pl"></span><div id="${id}c" style="height:260px"></div></div><div><b>Spread CDI+ e % do PU par</b> <span class="mini">(mediana entre os fundos; % do PU par pelo SND, só debêntures)</span><div id="${id}d" style="height:260px"></div></div>
+   <div class="g2"><div><b>Retorno total mensal do ativo × CDI</b><div id="${id}a" style="height:270px"></div></div><div><b>Curva acumulada: ativo × CDI</b><div id="${id}b" style="height:270px"></div></div>
+   <div><b>% do PL</b><div id="${id}c" style="height:260px"></div></div><div><b>Spread CDI+ e % do PU par</b><div id="${id}d" style="height:260px"></div></div>
    <div><b>ANBIMA: taxa indicativa e % do PU par (diário)</b><div id="${id}e" style="height:260px"></div></div><div class="mini" id="${id}f" style="align-self:center;line-height:1.6"></div></div></td>`;
   const M=D.meses,R=d.r||[],S=d.s||"",idx=M.map((m,i)=>i).filter(i=>R[i]!=null);if(!idx.length){$("#"+id+"a").innerHTML=$("#"+id+"b").innerHTML="<div class=\"mini\">Sem retorno mensal medido (ativo novo ou só em meses sem carteira anterior).</div>"}
   const EV=d.ev||{},fonte=i=>(FONTE[S[i]]||"—")+(EV[i]!=null?` (queda de preço observada: ${br(EV[i])}%)`:""),est=idx.filter(i=>S[i]=="E"||S[i]=="A").length,nev=Object.keys(EV).length;
@@ -2532,7 +2531,6 @@ function detalheAtivo(tr,ch,ncol,ctx){const prox=tr.nextElementSibling;if(prox&&
   if(!ctx||F[ctx].nosso){const pe=ent.filter(([fid])=>!F[fid].nosso),mm={};pe.forEach(([,arr])=>arr.forEach(q=>{(mm[q[0]]=mm[q[0]]||[]).push(q[1])}));
     const ks=Object.keys(mm).map(Number).sort((x,y)=>x-y);if(ks.length)tl.push({x:ks.map(q=>mesBR(M[q])),y:ks.map(q=>mm[q].reduce((x,y)=>x+y)/mm[q].length),name:"média dos peers que têm",mode:"lines",line:{color:"#9aa0a6",width:2,dash:"dot"},
       text:ks.map(q=>mm[q].length+" peers"),hovertemplate:"média peers: %{y:.2f}% (%{text})<extra>%{x}</extra>"})}
-  $("#"+id+"pl").textContent=ctx&&!F[ctx].nosso?`(${F[ctx].nome} em preto e nossos fundos em laranja)`:"(nossos fundos em laranja e média dos peers que têm)";
   if(tl.length)plot(id+"c",tl,LAY({yaxis:{title:{text:"% do PL"}},xaxis:{type:"category",categoryorder:"array",categoryarray:M.map(mesBR)}}));else $("#"+id+"c").innerHTML='<div class="mini">Nem este fundo nem os nossos têm o ativo.</div>';
   const h=d.h,temPar=h&&h.par.some(x=>x!=null);
   if(h)plot(id+"d",[{x:h.m.map(i=>mesBR(M[i])),y:h.sp,name:"spread CDI+ (esq.)",mode:"lines+markers",line:{color:"#eb6834",width:2}},
@@ -2542,12 +2540,8 @@ function detalheAtivo(tr,ch,ncol,ctx){const prox=tr.nextElementSibling;if(prox&&
   if(an&&(temTx||temAp))plot(id+"e",[...(temTx?[{x:an.d,y:an.tx,name:`taxa indicativa (${an.ind}) (esq.)`,mode:"lines+markers",line:{color:"#1f5f87",width:2}}]:[]),
     ...(temAp?[{x:an.d,y:an.par,name:"% do PU par (dir.)",mode:"lines",line:{color:"#eb6834",width:2,dash:"dot"},yaxis:"y2"}]:[])],
     LAY({yaxis:{title:{text:"taxa (%)"}},yaxis2:{title:{text:"% PU par"},overlaying:"y",side:"right"},margin:{l:56,r:60,t:10,b:40}}));
-  else $("#"+id+"e").innerHTML=`<div class="mini">Sem marcação ANBIMA para este ativo: de graça a ANBIMA só publica debêntures (CRI/CRA, LF, CDB, FIDC e NC não têm arquivo público). Histórico desde ${diaBR(D.anb_ini)}, cresce a cada atualização.</div>`;
-  $("#"+id+"f").innerHTML=`<b>Como o retorno do ativo é medido</b><br>Retorno total do mês, comparável ao CDI: preço + juros/amortização pagos, sem hedge nem resíduo do fundo.<br>`+
-   `• Debêntures: preço do fundo + o que foi pago no mês (queda do PU par do SND).<br>• FIDC: rentabilidade oficial da série (CVM).<br>• LF/LFSN/CDB: preço (não pagam no meio).<br>`+
-   `• CRI/CRA: preço do fundo + juros/amortização pagos no mês pelo informe mensal da securitizadora (CVM), casando a série por ISIN/código ou devedor + vencimento.<br>`+
-   `• CRI/CRA sem série casada, NC e CCB (fluxo não público): preço abaixo do esperado = pagamento → carrego + curva; queda forte que não volta fica amarela para conferir.<br>`+
-   `Este ativo: ${idx.length} meses, ${idx.length-est} com preço observado e ${est} estimados (barra azul clara)${nev?` • <b style="color:#b26b00">${nev} mês(es) com queda forte de preço (barra amarela)</b>`:""}.`}
+  else $("#"+id+"e").innerHTML=`<div class="mini">Sem marcação ANBIMA.</div>`;
+  $("#"+id+"f").innerHTML=nev?`<b style="color:#b26b00">${nev} mês(es) com queda forte de preço (barra amarela)</b>`:""}
 // ---------- fundo
 $("#f_sel").innerHTML=[...D.fundos].sort((a,b)=>(b.nosso-a.nosso)||a.nome.localeCompare(b.nome)).map(f=>`<option value="${f.id}">${f.nosso?"★ ":""}${esc(f.nome)}</option>`).join("");
 $("#f_sel").onchange=fundo;["#f_mes","#f_cat","#f_busca"].forEach(s=>$(s).oninput=tabFundo);
@@ -2598,7 +2592,7 @@ function mudancas(){const f=F[$("#f_sel").value],ms=[...new Set(D.ativos.filter(
   if(ms.length<2){$("#f_mud_sub").textContent="Precisa de duas carteiras abertas.";$("#f_mud_up").innerHTML=$("#f_mud_dn").innerHTML="";return}
   const [m0,m1]=ms.slice(-2),pega=m=>{const o={};D.ativos.filter(a=>a[0]==f.id&&a[1]==m&&!["Caixa","Títulos Públicos","Ajuste"].includes(a[4])).forEach(a=>{o[a[2]]=o[a[2]]||{r:a[3],c:a[4],p:0};o[a[2]].p+=a[7]});return o};
   const A=pega(m0),B=pega(m1),ks=new Set([...Object.keys(A),...Object.keys(B)]),L=[...ks].map(k=>({k,r:(B[k]||A[k]).r,c:(B[k]||A[k]).c,a:A[k]?A[k].p:0,b:B[k]?B[k].p:0})).map(x=>({...x,d:x.b-x.a}));
-  $("#f_mud_sub").textContent=`${mesBR(m0)} → ${mesBR(m1)} (carteiras abertas) • variação em pontos de % do PL`;
+  $("#f_mud_sub").textContent=`${mesBR(m0)} → ${mesBR(m1)}`;
   const tb=(arr)=>"<tr><th class='l'>Ativo</th><th class='l'>Categoria</th><th>Antes</th><th>Depois</th><th>Δ pp</th></tr>"+arr.map(x=>`<tr class="cl" data-ch="${esc(x.k)}"><td class="l">${esc(x.r)}${!x.a?' <span class="tag" style="background:#1f7a4d">NOVO</span>':!x.b?' <span class="tag" style="background:#b42318">SAIU</span>':""}</td><td class="l mut">${esc(x.c)}</td><td>${br(x.a)}</td><td>${br(x.b)}</td><td class="${cls(x.d)}"><b>${x.d>0?"+":""}${br(x.d)}</b></td></tr>`).join("");
   $("#f_mud_up").innerHTML=tb(L.filter(x=>x.d>0.005).sort((a,b)=>b.d-a.d).slice(0,15));$("#f_mud_dn").innerHTML=tb(L.filter(x=>x.d<-0.005).sort((a,b)=>a.d-b.d).slice(0,15));
   ["#f_mud_up","#f_mud_dn"].forEach(s=>$(s).querySelectorAll("tr.cl").forEach(t=>t.onclick=()=>detalheAtivo(t,t.dataset.ch,5,f.id)))}
