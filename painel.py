@@ -1089,7 +1089,7 @@ CAT_CORES = ["#2a78d6", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7", "#008300", "
 NOSSAS_CORES = ["#eb6834", "#c24f1d", "#f29a6b", "#a8401a", "#f5b38d"]
 GENERICO = (r"(?i)\b(FUNDO DE INVESTIMENTO|FUNDO|EM DIREITOS CREDIT[OÓ]RIOS|DE INVESTIMENTO|FIDC|FIC|FI|COTAS|MULTIMERCADO|"
             r"RENDA FIXA|CR[EÉ]DITO PRIVADO|RESPONSABILIDADE LIMITADA|RESP LTDA|N[AÃ]O PADRONIZADO|NP|LONGO PRAZO|LP)\b")
-METODO = 31                                     # suba quando mudar o calculo -> refaz o cache do dia
+METODO = 33                                     # suba quando mudar o calculo -> refaz o cache do dia
 CAIXA = ("Caixa",)
 CAIXA_CVM = ("Disponibilidades", "Operações Compromissadas", "Valores a receber", "Valores a pagar", lt.AJUSTE)
 TIPO_CASA = {"CDB/ RDB": "CDB", "CDB Vinculado": "CDB", "DPGE": "DPGE", "FI Imobiliário": "FII", "FI Participações": "FIP",
@@ -1470,7 +1470,8 @@ class Contexto:
         pag = np.clip(p0 * (1 + base) * (1 + np.nan_to_num(s) / 100) ** (1 / 12) - p1, 0, None)
         pag = np.where(pag > 0.005 * p0, pag, 0.0)   # pagamento = PU par esperado (anterior + remuneracao) - observado; juros mensais
                                                      # deixam o PU par do fim do mes ~igual ao anterior, por isso nao exige queda
-        ok = padrao & np.isfinite(pag) & (p0 > 0) & (p1 > 0) & np.isfinite(pu_ant)
+        sobe = p1 > p0 * (1 + base) * (1 + np.nan_to_num(s) / 100) ** (1 / 12) * 1.02   # PU par subiu mais que o rendimento: SND errado
+        ok = padrao & np.isfinite(pag) & (p0 > 0) & (p1 > 0) & np.isfinite(pu_ant) & ~sobe
         return np.where(ok, pag, np.nan)
 
     def taxa(self, m, cods, T, pj, pa, car, base, s0, pp_):
@@ -1499,7 +1500,9 @@ class Contexto:
             return None, None
         alvo = fim_mes(m)
         perto = [d for d in self.an_dias if abs((pd.Timestamp(d) - alvo).days) <= 10]
-        d = min(perto, key=lambda d: abs((pd.Timestamp(d) - alvo).days)) if perto else (self.an_dias[-1] if m in recentes else None)
+        ult = self.an_dias[-1]
+        d = min(perto, key=lambda d: abs((pd.Timestamp(d) - alvo).days)) if perto else (
+            ult if m in recentes and pd.Timestamp(ult) <= alvo + pd.Timedelta(days=10) else None)   # point in time: nada de marcacao futura
         return (d, self.an_h[self.an_h.data == d].drop_duplicates("codigo").set_index("codigo")) if d is not None else (None, None)
 
 
@@ -1760,6 +1763,9 @@ def mede(g, m, ctx, recentes, impl, ant=None):
                 else:
                     fonte[sel & ~falta_s] = fonte[sel & ~falta_s] + rotulo_
     g["spread"], g["duration"], g["pu"], g["fonte"] = sp, du, pu_f, fonte
+    tx = np.where(ind == "IPCA", sp + curva("IPCA", du), np.where(ind == "PRE", sp + curva("PRE", du), sp))
+    g["taxa"] = np.where(pd.Series(fonte).astype(str).str.startswith("estimado").values, np.nan, tx)   # estimativa de categoria nao e taxa do papel
+    g["ind"] = np.where(np.isin(ind, ["IPCA", "PRE"]), ind, np.where(ind == "USD", "USD", "DI"))
     g["ipca"], g["pre"] = ind == "IPCA", ind == "PRE"
     g["usd"] = np.isin(ca, USD) | (ind == "USD")
     return g, dia
@@ -1888,16 +1894,19 @@ def detalhe(nome, cnpj, df, ctx, pl, rent):
                            "cats": cats, "total": total, "fontes": fontes.sort_values(ascending=False).to_dict()})
         # tabela de ativos do mes (rotulo curto), maior posicao primeiro
         x = e[e.perc_pl != 0].sort_values("perc_pl", ascending=False)
-        x = x.assign(sw=(x.spread * x.perc_pl).fillna(0), sp_=x.perc_pl.where(x.spread.notna(), 0),
+        x = x.assign(tw=(x.taxa * x.perc_pl).fillna(0), tp_=x.perc_pl.where(x.taxa.notna(), 0),
+                     sw=(x.spread * x.perc_pl).fillna(0), sp_=x.perc_pl.where(x.spread.notna(), 0),
                      dw=(x.duration * x.perc_pl).fillna(0), dp=x.perc_pl.where(x.duration.notna(), 0))
         t = x.groupby("rotulo", sort=False).agg(categoria=("casa", "first"), grupo=("grupo", "first"), emissor=("emissor", "first"),
                                                 codigo=("codigo", "first"), perc=("perc_pl", "sum"), sw=("sw", "sum"), sp_=("sp_", "sum"),
-                                                dw=("dw", "sum"), dp=("dp", "sum"), pu=("pu", "first"), fonte=("fonte", "first")).reset_index()
+                                                dw=("dw", "sum"), dp=("dp", "sum"), pu=("pu", "first"), fonte=("fonte", "first"),
+                                                tw=("tw", "sum"), tp_=("tp_", "sum"), ind=("ind", "first")).reset_index()
+        t["taxa"] = (t.tw / t.tp_).where(t.tp_ != 0)
         t["spread"] = (t.sw / t.sp_).where(t.sp_ != 0)
         t["pct_par"] = (t.pu / ctx.pu_par(m).reindex(t.codigo.fillna("").values).values * 100).where(t.categoria.isin(["DEB", "DEBIN"]))
         t["pct_par"] = t.pct_par.where(t.pct_par.between(30, 130))
         t["duration"] = (t.dw / t.dp).where(t.dp != 0)
-        tab_ativos.append(t.drop(columns=["sw", "sp_", "dw", "dp"]).assign(mes=m))
+        tab_ativos.append(t.drop(columns=["sw", "sp_", "dw", "dp", "tw", "tp_"]).assign(mes=m))
 
     # ---- atribuicao mensal (retorno por categoria, hedges alocados nos ativos protegidos)
     real = rent[rent.fundo == nome].set_index("mes").retorno
@@ -1985,6 +1994,8 @@ def detalhe(nome, cnpj, df, ctx, pl, rent):
         if deb.any():
             pag = np.full(len(w), np.nan)
             pag[deb] = ctx.pagto_snd(w.codigo.fillna("").values[deb], p, m, pu0[deb])
+            queda = pu0 * (1 + esperado.values) - pu1            # o que o PU do fundo caiu alem do carrego esperado
+            pag = np.where(np.isfinite(pag) & (pag > queda + 0.02 * pu0), np.nan, pag)   # SND diz pagamento que o fundo nao viu
             rt = (pu1 + pag) / pu0 - 1
             # preco ja corrigido entre fundos: marcacao a mercado entra direto; queda > 25% no mes so se persistir
             ok = np.isfinite(rt) & (rt < 0.3) & ((rt > -0.25) | ((rt > -0.8) & persiste(rt)))
@@ -2262,7 +2273,7 @@ def exporta_html(pasta=None, saida=None, log=print):
             t = pd.read_parquet(ja)
             t = t[~t.categoria.isin(["Confidencial"]) & (t.perc.abs() >= .005)]
             t = t.assign(chave=[_chave(c, r) for c, r in zip(t.codigo, t.rotulo)], id=f["id"])
-            pos.append(t.reindex(columns=["id", "mes", "chave", "rotulo", "categoria", "grupo", "emissor", "perc", "pct_par", "spread", "duration", "pu"]))
+            pos.append(t.reindex(columns=["id", "mes", "chave", "rotulo", "categoria", "grupo", "emissor", "perc", "pct_par", "spread", "duration", "pu", "taxa", "ind"]))
             pls = {c["m"]: c["pl"] for c in carteira}
             for r in t[t.mes.isin(abertos[-MESES_ATIVOS:])].itertuples():
                 ativos.append([f["id"], r.mes, r.chave, str(r.rotulo), r.categoria, str(r.grupo or ""), str(r.emissor or ""),
@@ -2274,16 +2285,21 @@ def exporta_html(pasta=None, saida=None, log=print):
     P = P.groupby(["id", "mes", "chave"], as_index=False).agg(rotulo=("rotulo", "first"), categoria=("categoria", "first"),
                                                               grupo=("grupo", "first"), emissor=("emissor", "first"), perc=("perc", "sum"),
                                                               pct_par=("pct_par", "median"), spread=("spread", "median"), duration=("duration", "median"),
-                                                              pu=("pu", "first"))
+                                                              pu=("pu", "first"), taxa=("taxa", "median"), ind=("ind", "first"))
     # CRI/CRA casados com a serie da securitizadora: % do VNA (PU do fundo / valor nominal atualizado da serie)
     sec = ContextoSecurit()
     cr = P.categoria.isin(["CRI", "CRA"]) & P.chave.isin(sec.series)
     P.loc[cr, "pct_par"] = [(pu / v * 100 if np.isfinite(v) and v > 0 else np.nan) for pu, v in
                             zip(P.pu[cr], [sec.ancora(c, m, pu)[0] for c, m, pu in zip(P.chave[cr], P.mes[cr], P.pu[cr])])]
     P["pct_par"] = P.pct_par.where(P.pct_par.between(30, 130))
+    di_ = P.chave.map(lt.snd_caracteristicas().indice).eq("DI") | P.ind.eq("DI")
+    P["pct_par"] = P.pct_par.mask(di_ & (P.pct_par > 104))
+    alto = di_ & ((P.pct_par.between(95, 105) & (P.taxa > 12)) | (P.pct_par.isna() & (P.taxa > 20)))   # CDI+12 ao par / CDI+20 sem preco: taxa mal lida
+    P["spread"], P["taxa"] = P.spread.mask(alto), P.taxa.mask(alto)
     # spread que contradiz o preco (abaixo do par com spread baixo: fluxo reestruturado, default, preco parado) -> sem spread
     lim = 0.5 * (100 - P.pct_par) / P.duration.clip(lower=0.5).fillna(1) - 3
-    P["spread"] = P.spread.mask((P.pct_par < 97) & (P.spread < lim))
+    ruim = (P.pct_par < 97) & (P.spread < lim)
+    P["spread"], P["taxa"] = P.spread.mask(ruim), P.taxa.mask(ruim)
     P = P[[m <= ult.get(i, "") for i, m in zip(P.id, P.mes)]]       # corte de cada fundo: ultima carteira aberta
     P["nosso"] = P.id.map(nosso)
     P["rs"] = [(p or 0) / 100 * (pls_mes.get((i, m)) or 0) for i, m, p in zip(P.id, P.mes, P.perc)]
@@ -2359,8 +2375,18 @@ def exporta_html(pasta=None, saida=None, log=print):
     # historico do clique: retorno mensal, % PL em cada fundo, spread e PU informados pelos fundos, ANBIMA, ultimos negocios B3
     Pd = P[P.chave.isin(det_ch) & P.mes.isin(set(meses[-36:]))]          # % PL e spread: ultimos 36 meses
     pl_hist = {ch: {fid: [[mi[m], _r(p, 3)] for m, p in zip(gg.mes, gg.perc)] for fid, gg in g.groupby("id")} for ch, g in Pd.groupby("chave")}
-    med = Pd.groupby(["chave", "mes"]).agg(sp=("spread", "median"), par=("pct_par", "median"), du=("duration", "median")).reset_index()
-    med_h = {ch: {"m": [mi[m] for m in g.mes], "sp": [_r(x) for x in g.sp], "par": [_r(x, 2) for x in g.par], "du": [_r(x) for x in g.du]}
+    med = Pd.groupby(["chave", "mes"]).agg(sp=("spread", "median"), par=("pct_par", "median"), du=("duration", "median"),
+                                           tx=("taxa", "median"), ind=("ind", "last")).reset_index()
+    def sem_pico(v):
+        v = np.array(v, float)
+        for k in range(1, len(v) - 1):
+            if np.isfinite(v[k - 1:k + 2]).all() and abs(v[k] - v[k - 1]) > 10 and abs(v[k + 1] - v[k - 1]) < 3:
+                v[k] = np.nan
+        return v
+    pico = med.par.notna() & med.groupby("chave").par.transform(lambda x: sem_pico(x.values)).isna()
+    med["par"], med["tx"], med["sp"] = med.par.mask(pico), med.tx.mask(pico), med.sp.mask(pico)   # mes do pico: preco e taxa do mesmo dado ruim
+    med_h = {ch: {"m": [mi[m] for m in g.mes], "sp": [_r(x) for x in g.sp], "par": [_r(x, 2) for x in g.par], "du": [_r(x) for x in g.du],
+                  "tx": [_r(x) for x in g.tx], "ind": str(g.ind.dropna().iloc[-1]) if g.ind.notna().any() else "DI"}
              for ch, g in med.groupby("chave")}
     try:
         _, an = lt.anbima_debentures()
@@ -2568,9 +2594,10 @@ function detalheAtivo(tr,ch,ncol,ctx){const prox=tr.nextElementSibling;if(prox&&
   const n=document.createElement("tr");n.className="det";tr.after(n);
   if(!d){n.innerHTML=`<td colspan="${ncol}">Sem histórico detalhado para este ativo no arquivo (fica só para os ${Object.keys(D.det).length} mais relevantes).</td>`;return}
   const w=p.w12||[],u3=p.ult3||[],cat=d.cat||p.categoria||o.categoria||"",h=d.h,an=d.anb;
-  const vna=["CRI","CRA"].includes(cat),temPar=h&&h.par.some(x=>x!=null),temSp=h&&h.sp.some(x=>x!=null),
+  const vna=["CRI","CRA"].includes(cat),TX=h?(h.tx||h.sp):[],unTx={IPCA:"IPCA+",PRE:"pré",USD:"US$"}[h&&h.ind]||"CDI+",
+    temPar=h&&h.par.some(x=>x!=null),temSp=TX.some(x=>x!=null),
     temTx=an&&an.tx.some(x=>x!=null),temAp=an&&an.par.some(x=>x!=null),verSp=!MERCADO.has(cat)&&cat!="FIDC"&&(temSp||temPar),verAn=temTx||temAp;
-  const tSp=(temSp?(d.ind&&d.ind!="DI"?"Spread (CDI+ equivalente)":"Spread CDI+"):"")+(temSp&&temPar?" e ":"")+(temPar?(vna?"% do VNA":"% do PU par"):"");
+  const tSp=(temSp?`Taxa indicativa (${unTx})`:"")+(temSp&&temPar?" e ":"")+(temPar?(vna?"% do VNA":"% do PU par"):"");
   const k=[["Último mês",u3[2]==null?"—":br(u3[2])+"%",mesBR(D.meses[D.meses.length-1])],["3 meses",u3.length&&u3.every(x=>x!=null)?br((u3.reduce((a,x)=>a*(1+x/100),1)-1)*100)+"%":"—",""],
     ["12 meses",w[0]==null?"—":br(w[0])+"%",w[1]==null?"":br(w[1],0)+"% do CDI"],["Vol / Sharpe 12m",(w[2]==null?"—":br(w[2])+"%")+" / "+(w[3]==null?"—":br(w[3])),""],
     ...(MERCADO.has(cat)?[]:[[cat=="FIDC"?"Spread realizado (6m)":"Spread / duration",(p.spread??o.spread)==null?"—":"CDI+ "+br(p.spread??o.spread),cat=="FIDC"||(p.duration??o.duration)==null?"":br(p.duration??o.duration)+" anos"]]),
@@ -2595,9 +2622,9 @@ function detalheAtivo(tr,ch,ncol,ctx){const prox=tr.nextElementSibling;if(prox&&
       text:ks.map(q=>mm[q].length+" peers"),hovertemplate:"média peers: %{y:.2f}% (%{text})<extra>%{x}</extra>"})}
   if(tl.length)plot(id+"c",tl,LAY({yaxis:{title:{text:"% do PL"}},xaxis:{type:"category",categoryorder:"array",categoryarray:M.map(mesBR)}}));else $("#"+id+"c").innerHTML='<div class="mini">Nem este fundo nem os nossos têm o ativo.</div>';
   const nPar=vna?"% do VNA":"% do PU par",so=temSp&&!temPar;
-  if(verSp)plot(id+"d",[...(temSp?[{x:h.m.map(i=>mesBR(M[i])),y:h.sp,name:"spread"+(temPar?" (esq.)":""),mode:"lines+markers",line:{color:"#eb6834",width:2},hovertemplate:"spread %{y:.2f}%<extra>%{x}</extra>"}]:[]),
+  if(verSp)plot(id+"d",[...(temSp?[{x:h.m.map(i=>mesBR(M[i])),y:TX,name:`taxa ${unTx}`+(temPar?" (esq.)":""),mode:"lines+markers",line:{color:"#eb6834",width:2},hovertemplate:`${unTx} %{y:.2f}%<extra>%{x}</extra>`}]:[]),
     ...(temPar?[{x:h.m.map(i=>mesBR(M[i])),y:h.par,name:nPar+(temSp?" (dir.)":""),mode:"lines+markers",line:{color:"#2a78d6",width:2,dash:"dot"},yaxis:temSp?"y2":"y",hovertemplate:nPar+" %{y:.1f}<extra>%{x}</extra>"}]:[])],
-    LAY({yaxis:{title:{text:temSp?"% a.a.":nPar}},...(temSp&&temPar?{yaxis2:{title:{text:nPar},overlaying:"y",side:"right"}}:{}),xaxis:{type:"category"},margin:{l:56,r:60,t:10,b:40}}));
+    LAY({yaxis:{title:{text:temSp?unTx+" (% a.a.)":nPar}},...(temSp&&temPar?{yaxis2:{title:{text:nPar},overlaying:"y",side:"right"}}:{}),xaxis:{type:"category"},margin:{l:56,r:60,t:10,b:40}}));
   if(verAn)plot(id+"e",[...(temTx?[{x:an.d,y:an.tx,name:`taxa indicativa (${an.ind}) (esq.)`,mode:"lines+markers",line:{color:"#1f5f87",width:2}}]:[]),
     ...(temAp?[{x:an.d,y:an.par,name:"% do PU par (dir.)",mode:"lines",line:{color:"#eb6834",width:2,dash:"dot"},yaxis:"y2"}]:[])],
     LAY({yaxis:{title:{text:"taxa (%)"}},yaxis2:{title:{text:"% PU par"},overlaying:"y",side:"right"},margin:{l:56,r:60,t:10,b:40}}));
