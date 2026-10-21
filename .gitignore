@@ -1,0 +1,5 @@
+__pycache__/
+dados_painel/
+painel_fundos.html
+painel_fundos.estado.json
+*.xlsx
