@@ -141,7 +141,7 @@ CACHE = Path(os.environ.get("PAINEL_DADOS") or (Path(os.environ["LOCALAPPDATA"])
              else Path(__file__).resolve().parent / "dados_painel"))   # Windows: fora do OneDrive (GBs da CVM); senao ao lado do .py
 (CACHE / "rec").mkdir(parents=True, exist_ok=True)
 VERSAO_DIARIO = 4               # recorte das cotas diarias (3: fundos que so informam cota por subclasse)
-VERSAO = 2                      # muda quando o recorte guarda colunas novas (forca reprocessar)
+VERSAO = 3                      # muda quando o recorte guarda colunas novas (forca reprocessar); 3: CNPJ do emissor e descricao
 REN = {"CNPJ_FUNDO": "CNPJ_FUNDO_CLASSE", "CNPJ_FUNDO_COTA": "CNPJ_FUNDO_CLASSE_COTA",
        "NM_FUNDO_COTA": "NM_FUNDO_CLASSE_SUBCLASSE_COTA"}             # nomes antigos (ate 2022) -> novos
 NUM = ["QT_POS_FINAL", "VL_CUSTO_POS_FINAL", "VL_AQUIS_NEGOC", "VL_VENDA_NEGOC", "PR_INDEXADOR_POSFX",
@@ -249,6 +249,8 @@ def processa_cda(url, meses, peers):
             return out
         b["ativo"] = first("DS_ATIVO", "NM_FUNDO_CLASSE_SUBCLASSE_COTA", "DS_SWAP", "DS_ATIVO_EXTERIOR", "TP_TITPUB", "TP_ATIVO")
         b["emissor"] = first("EMISSOR", "CNPJ_EMISSOR", "CPF_CNPJ_EMISSOR")
+        b["cnpj_emissor"] = first("CPF_CNPJ_EMISSOR", "CNPJ_EMISSOR")
+        b["descricao"] = first("DS_ATIVO")
         b["codigo"] = first("CD_ATIVO", "CD_ISIN", "CNPJ_FUNDO_CLASSE_COTA", "CD_SWAP", "CD_ATIVO_BV_MERC")
         b.loc[b.conf, "ativo"] = "(confidencial) " + b.loc[b.conf, "TP_APLIC"].fillna("")
         b["ativo"] = b.ativo.fillna(b.TP_ATIVO).fillna(b.TP_APLIC)
@@ -257,9 +259,13 @@ def processa_cda(url, meses, peers):
                       + " " + venc).str.replace(r"\s+", " ", regex=True).str.strip()
         for c in NUM:
             b[c] = pd.to_numeric(b[c], errors="coerce") if c in b else None
-        keep = ["CNPJ_FUNDO_CLASSE", "TP_APLIC", "TP_ATIVO", "ativo", "codigo", "emissor", "CNPJ_FUNDO_CLASSE_COTA", "v",
+        keep = ["CNPJ_FUNDO_CLASSE", "TP_APLIC", "TP_ATIVO", "ativo", "codigo", "emissor", "cnpj_emissor", "descricao", "CNPJ_FUNDO_CLASSE_COTA", "v",
                 "DT_VENC", "DS_INDEXADOR_POSFX", "GRAU_RISCO", "AG_RISCO", "PAIS", *NUM]
-        b.reindex(columns=keep).to_parquet(CACHE / "rec" / f"cda_{m}.parquet", index=False)
+        destino = CACHE / "rec" / f"cda_{m}.parquet"
+        if destino.exists():                     # point in time: guarda a versao anterior do recorte (republicacao da CVM)
+            (CACHE / "rec" / "versoes").mkdir(exist_ok=True)
+            destino.replace(CACHE / "rec" / "versoes" / f"cda_{m}_{date.fromtimestamp(destino.stat().st_mtime)}.parquet")
+        b.reindex(columns=keep).assign(visto_em=str(date.today())).to_parquet(destino, index=False)
         lk.drop(columns="mes").to_parquet(CACHE / "rec" / f"links_{m}.parquet", index=False)
         pl[pl.mes == m][["CNPJ_FUNDO_CLASSE", "VL_PATRIM_LIQ"]].to_parquet(CACHE / "rec" / f"pl_{m}.parquet", index=False)
         (CACHE / "rec" / f"cda_{m}.json").write_text(json.dumps({"v": VERSAO, "fundos": sorted(alvo)}))
@@ -407,10 +413,10 @@ def lookthrough(nomes, meses, carga=None):
                             "AG_RISCO": "agencia", "PAIS": "pais", "v": "valor_veiculo", "QT_POS_FINAL": "quantidade",
                             "VL_CUSTO_POS_FINAL": "custo", "VL_AQUIS_NEGOC": "compras_veiculo",
                             "VL_VENDA_NEGOC": "vendas_veiculo", "pl_fundo": "pl_veiculo"})
-    df = df[["fundo", "mes", "categoria", "ativo", "codigo", "emissor", "perc_pl", "compra_pct", "venda_pct", "veiculo",
+    df = df.reindex(columns=["fundo", "mes", "categoria", "ativo", "codigo", "emissor", "cnpj_emissor", "descricao", "perc_pl", "compra_pct", "venda_pct", "veiculo",
              "cnpj_veiculo", "caminho", "tipo_ativo", "vencimento", "indexador", "pct_indexador", "cupom", "taxa_pre",
              "rating", "agencia", "pais", "quantidade", "valor_veiculo", "custo", "compras_veiculo", "vendas_veiculo",
-             "pl_veiculo", "fator"]]
+             "pl_veiculo", "fator"])
     df["categoria"] = df.categoria.fillna("Outros")
     df["codigo"] = df.codigo.str.strip()                  # CVM manda codigos com espacos (ex.: "ASER12  ")
     curto = df.ativo.fillna("").str.len() <= 4             # descricao generica ("DEB"): usa codigo + emissor
@@ -482,6 +488,93 @@ def anbima_debentures():
         return pd.DataFrame(), pd.DataFrame()
     hist = pd.concat([_le_anbima(f) for f in fs], ignore_index=True)
     return hist[hist.data == hist.data.max()], hist
+
+
+# ------------------------------------------------------------------ CRI/CRA: informe mensal das securitizadoras (CVM)
+SECURIT = "https://dados.cvm.gov.br/dados/SECURIT/DOC/INF_MENSAL_{t}/DADOS/inf_mensal_{tl}_{a}.zip"
+
+
+def securitizadoras(log=print, asof=None):
+    """Series de CRI e CRA (informe mensal das securitizadoras, CVM): por serie e mes, valor por certificado (VNA) e o que foi
+    pago por certificado no mes (juros + amortizacao). Conferido: (VNA + pago) / VNA anterior = CDI nas series 100% CDI
+    (erro < 0,05 p.p. em 89% dos meses). Devolve (series, devedores/cedentes por certificado). Ultima versao de cada documento;
+    `entrega` = data em que a CVM recebeu o documento (point in time). asof="AAAA-MM-DD": so o que a CVM tinha recebido ate a data.
+    A CVM guarda so a ultima versao de cada informe (8% sao reapresentados, mediana 162 dias depois): o arquivo anterior vai para
+    securit/versoes quando muda, para refazer o passado como era visto."""
+    pasta = CACHE / "securit"
+    pasta.mkdir(exist_ok=True)
+    num = lambda x: pd.to_numeric(x.astype(str).str.replace(",", ".", regex=False), errors="coerce")
+    ser, dev = [], []
+    for t in ("CRA", "CRI"):
+        for a in range(int(DESDE[:4]), date.today().year + 1):
+            f = pasta / f"inf_mensal_{t.lower()}_{a}.zip"
+            if not f.exists() or (a >= date.today().year - 1 and date.fromtimestamp(f.stat().st_mtime) < date.today()):
+                try:
+                    r = requests.get(SECURIT.format(t=t, tl=t.lower(), a=a), timeout=300)
+                    if r.status_code == 200:
+                        if f.exists() and f.stat().st_size != len(r.content):      # point in time: guarda a versao anterior
+                            (pasta / "versoes").mkdir(exist_ok=True)
+                            f.replace(pasta / "versoes" / f"{f.stem}_{date.fromtimestamp(f.stat().st_mtime)}.zip")
+                        f.write_bytes(r.content)
+                except requests.RequestException:
+                    log(f"   securitizadoras: {f.name} indisponivel")
+            if not f.exists():
+                continue
+            z = zipfile.ZipFile(f)
+            def le_(chave):
+                n = next((x for x in z.namelist() if chave in x), None)       # cedente_devedor nao existe em 2019 (CRI)
+                return pd.read_csv(z.open(n), sep=";", encoding="latin1", dtype=str, on_bad_lines="skip") if n else pd.DataFrame(
+                    columns=["Codigo_Identificacao_Certificado", "CNPJ", "Tipo"])
+            c, g, d = le_("classe"), le_("geral"), le_("cedente_devedor")
+            c = c.merge(g.reindex(columns=["Codigo_Identificacao_Certificado", "Data_Referencia", "Versao", "Data_Entrega", "CNPJ_Emissora",
+                                           "Data_Emissao"]).drop_duplicates(),
+                        on=["Codigo_Identificacao_Certificado", "Data_Referencia", "Versao"], how="left", suffixes=("", "_g"))
+            ser.append(c.assign(tipo=t))
+            dev.append(d[["Codigo_Identificacao_Certificado", "CNPJ", "Tipo"]])
+    if not ser:
+        return pd.DataFrame(), pd.DataFrame()
+    s = pd.concat(ser, ignore_index=True)
+    for k in ("Quantidade_Certificados", "Valor_Certificados", "Rendimentos", "Amortizacoes", "Versao"):
+        s[k] = num(s[k])
+    s["mes"] = s.Data_Referencia.str[:7]
+    if asof:
+        s = s[s.Data_Entrega.str[:10] <= str(asof)]
+    s = s.sort_values("Versao").drop_duplicates(["Codigo_CETIP", "Classe", "mes"], keep="last")
+    s = s[s.Quantidade_Certificados > 0]
+    cn = lambda x: x.astype(str).str.replace(r"\D", "", regex=True)
+    out = pd.DataFrame({"serie": s.Codigo_CETIP.str.strip().str.upper(), "isin": s.Codigo_ISIN.str.strip().str.upper(), "tipo": s.tipo,
+                        "certificado": s.Codigo_Identificacao_Certificado, "classe": s.Classe, "mes": s.mes,
+                        "venc": s.Data_Vencimento.str[:10], "taxa": s.Taxa_Juros.fillna(""), "cnpj_sec": cn(s.CNPJ_Emissora.fillna("")),
+                        "V": s.Valor_Certificados, "Q": s.Quantidade_Certificados, "P": s.Rendimentos.fillna(0) + s.Amortizacoes.fillna(0),
+                        "entrega": s.Data_Entrega.str[:10], "emissao": s.Data_Emissao.astype(str).str[:10]}).sort_values(["serie", "classe", "mes"])
+    # cada securitizadora preenche de um jeito: "Valor_Certificados" ora e o total da serie, ora o valor POR certificado; os
+    # pagamentos idem. Por serie, fica a leitura (4 combinacoes) em que o retorno ao par mes a mes e coerente (mediana perto de
+    # 1% a.m. e pouca dispersao); serie sem leitura coerente fica sem VNA (nao usada).
+    mi = out.mes.str[:4].astype(int) * 12 + out.mes.str[5:7].astype(int)
+    seg = (out.serie == out.serie.shift()) & (out.classe == out.classe.shift()) & (mi - mi.shift() == 1)
+    melhor, nota = None, None
+    for vu in (False, True):
+        for pu_ in (False, True):
+            vna = out.V if vu else out.V / out.Q
+            pago = out.P if pu_ else out.P / out.Q
+            r = ((vna + pago) / vna.shift() - 1).where(seg)
+            sc = r.sub(0.01).abs().groupby([out.serie, out.classe]).median()
+            if melhor is None:
+                melhor, nota = pd.DataFrame({"sc": sc}), {}
+            melhor[(vu, pu_)] = sc
+    esc = melhor.drop(columns="sc").idxmin(axis=1)
+    sc_min = melhor.drop(columns="sc").min(axis=1)
+    k = pd.MultiIndex.from_arrays([out.serie, out.classe])
+    e = esc.reindex(k).values
+    vu = np.array([x[0] if isinstance(x, tuple) else False for x in e])
+    pu_ = np.array([x[1] if isinstance(x, tuple) else False for x in e])
+    ok = sc_min.reindex(k).values < 0.01                                  # mediana a menos de 1 p.p. de 1% a.m.
+    out["vna"] = np.where(ok, np.where(vu, out.V, out.V / out.Q), np.nan)
+    out["pago"] = np.where(ok, np.where(pu_, out.P, out.P / out.Q), np.nan)
+    # V, Q, P ficam: no motor a leitura e escolhida mes a mes pelo PU que o proprio fundo informa (ancora)
+    d = pd.concat(dev, ignore_index=True).drop_duplicates()
+    d = pd.DataFrame({"certificado": d.Codigo_Identificacao_Certificado, "cnpj": cn(d.CNPJ), "papel": d.Tipo})
+    return out.reset_index(drop=True), d
 
 
 # ------------------------------------------------------------------ SND (debentures.com.br), FIDC (CVM) e Treasury: cobertura total
@@ -996,7 +1089,7 @@ CAT_CORES = ["#2a78d6", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7", "#008300", "
 NOSSAS_CORES = ["#eb6834", "#c24f1d", "#f29a6b", "#a8401a", "#f5b38d"]
 GENERICO = (r"(?i)\b(FUNDO DE INVESTIMENTO|FUNDO|EM DIREITOS CREDIT[OÓ]RIOS|DE INVESTIMENTO|FIDC|FIC|FI|COTAS|MULTIMERCADO|"
             r"RENDA FIXA|CR[EÉ]DITO PRIVADO|RESPONSABILIDADE LIMITADA|RESP LTDA|N[AÃ]O PADRONIZADO|NP|LONGO PRAZO|LP)\b")
-METODO = 28                                     # suba quando mudar o calculo -> refaz o cache do dia
+METODO = 30                                     # suba quando mudar o calculo -> refaz o cache do dia
 CAIXA = ("Caixa",)
 CAIXA_CVM = ("Disponibilidades", "Operações Compromissadas", "Valores a receber", "Valores a pagar", lt.AJUSTE)
 TIPO_CASA = {"CDB/ RDB": "CDB", "CDB Vinculado": "CDB", "DPGE": "DPGE", "FI Imobiliário": "FII", "FI Participações": "FIP",
@@ -1140,6 +1233,16 @@ class Contexto:
             alvo.update(falta)
         self.pu_dia = alvo
         self.pu = {d: x.drop_duplicates("codigo").set_index("codigo").pu_par for d, x in pu.groupby("data")}
+        log("Informe mensal das securitizadoras (CRI/CRA, CVM)...")
+        self.sec, self.sec_dev = lt.securitizadoras(log)
+        if len(self.sec):
+            self.sec_m = self.sec.drop_duplicates(["serie", "mes"]).set_index(["serie", "mes"])[["V", "Q", "P", "vna", "pago"]]
+            self.sec_isin = self.sec[self.sec["isin"].str.len() == 12].drop_duplicates("isin").set_index("isin").serie
+            ids = set(self.sec.serie)
+            por = self.sec.drop_duplicates(["serie", "certificado"])[["serie", "certificado", "venc", "taxa", "classe", "cnpj_sec", "emissao"]]
+            self.sec_prefixo = self.sec.serie.drop_duplicates()
+            ligados = pd.concat([por.assign(cnpj=por.cnpj_sec), por.merge(self.sec_dev, on="certificado")[por.columns.tolist() + ["cnpj"]]])
+            self.sec_chave = ligados.drop_duplicates(["serie", "cnpj"])
         f, ser = lt.fidc_mensal(lt.DESDE, log)
         self.fidc = {c: (x.mes.values, x.anos.values) for c, x in f.sort_values("mes").groupby("cnpj")}
         ser = ser[(ser.cota > 0) & ser.rent.notna()].sort_values(["cnpj", "serie", "mes"])
@@ -1228,6 +1331,128 @@ class Contexto:
             return np.nan
         i = np.nanargmin(dif)                   # rentabilidade oficial do mes (X_3); cota + amortizacao so se ela faltar/absurda
         return float(rent[i]) if np.isfinite(rent[i]) and -0.2 < rent[i] < 0.1 else float(rt[i])
+
+    def serie_securit(self, x):
+        """CRI/CRA da carteira -> serie no informe das securitizadoras. 1) ISIN ou codigo CETIP na descricao; 2) CNPJ (securitizadora,
+        devedor ou cedente) + vencimento, desempate pelo indexador e pelo PU do fundo mais perto do valor da serie no mes. So casa
+        quando sobra uma serie; ambiguo fica sem serie (continua a regra do carrego)."""
+        if not len(getattr(self, "sec", ())):
+            return pd.Series(None, index=x.index, dtype=object)
+        txt = (x.descricao.fillna("") + " " + x.ativo.fillna("")).str.upper()
+        isin = txt.str.extract(r"\b(BR[A-Z0-9]{4}CR[AI][A-Z0-9]{3})\b")[0]
+        out = isin.map(self.sec_isin).where(isin.notna())
+        cet = txt.str.extract(r"(?<![0-9A-Z])(\d{2}[A-L]\d{7}|CR[AI]\d{3}[0-9A-Z]{4,6})(?![0-9A-Z])")[0]
+        out = out.where(out.notna(), cet.where(cet.isin(set(self.sec.serie))))
+        ddmmyy = lambda t: pd.to_datetime(t, format="%d%m%y", errors="coerce").dt.strftime("%Y-%m-%d")
+        venc = pd.to_datetime(x.vencimento, errors="coerce").dt.strftime("%Y-%m-%d")
+        venc = venc.fillna(pd.to_datetime(txt.str.extract(r"(\d{2}/\d{2}/\d{4})")[0], dayfirst=True, errors="coerce").dt.strftime("%Y-%m-%d"))
+        barras = txt.str.extract(r"CR[IA]\s*/[^/]+/\s*(\d{6})\s*/\s*(\d{6})\s*/\s*(\d{14})")   # CRI/SECURIT/emissao/vencimento/CNPJ
+        venc = venc.fillna(ddmmyy(barras[1])).fillna(ddmmyy(txt.str.extract(r"CR[IA]:[^:]+:(\d{6})\b")[0]))   # CRI:SIGLA:vencimento
+        emis = ddmmyy(barras[0])
+        pref = txt.str.extract(r"CR[IA]-(\d{2}[A-L]\d{3,6})\b")[0]                                        # codigo CETIP truncado
+        for i in x.index[out.isna() & pref.notna()]:
+            c_ = self.sec_prefixo[self.sec_prefixo.str.startswith(pref[i], na=False)]
+            if len(c_) == 1:
+                out[i] = c_.iloc[0]
+        cn = x.cnpj_emissor.fillna("").astype(str).str.replace(r"\D", "", regex=True)
+        cn = cn.where(cn.ne(""), barras[2].fillna(""))
+        idx = x.indexador.fillna("").astype(str).str.upper()
+        pu = (x.valor_veiculo / x.quantidade).where(x.quantidade > 0)
+        falta = out.isna() & cn.ne("") & venc.notna()
+        if falta.any():
+            k, self.motivo = self.sec_chave, {}
+            # mesmo papel ao longo dos meses (veiculo + CNPJ + vencimento + descricao): decide a serie com o historico inteiro
+            grupo = (x.get("cnpj_veiculo", pd.Series("", index=x.index)).fillna("").astype(str) + "|" + cn + "|" + venc.fillna("") + "|"
+                     + x.descricao.fillna("").astype(str))
+            for _, ii in pd.Series(x.index[falta]).groupby(grupo[falta].values):
+                ii = list(ii)
+                i0 = ii[0]
+                kc = k[k.cnpj == cn[i0]]
+                c, perto = kc[kc.venc == venc[i0]], False
+                if c.empty:                            # vencimento informado diferente do informe (dias uteis, prorrogacao) ou data = emissao
+                    dv = (pd.to_datetime(kc.venc, errors="coerce") - pd.Timestamp(venc[i0])).dt.days.abs()
+                    c, perto = kc[(dv <= 40) | (kc.emissao == venc[i0])], True
+                if len(c) > 1 and idx[i0]:
+                    di = "DI" in idx[i0] or "CDI" in idx[i0]
+                    tx = c.taxa.str.upper()
+                    c = c[tx.str.contains("DI") == di] if "IPCA" not in idx[i0] else c[tx.str.contains("IPCA")]
+                if c.serie.nunique() > 1 and isinstance(emis[i0], str):        # data de emissao no texto
+                    c2 = c[c.emissao == emis[i0]]
+                    c = c2 if len(c2) else c
+                cands = list(c.serie.unique())
+                self.motivo.update(dict.fromkeys(ii, len(cands)))
+                if len(cands) > 1 or (perto and cands):  # distancia mediana |PU do fundo / VNA - 1| em todos os meses com o papel
+                    d = pd.Series({s_: np.nanmedian([self.ancora(s_, x.mes[i], pu[i])[2] for i in ii if np.isfinite(pu[i])] or [np.inf])
+                                   for s_ in cands}).sort_values()
+                    ok_ = d.iloc[0] < 0.05 and (len(d) == 1 or d.iloc[1] > 2 * d.iloc[0] + 0.01)
+                    if not ok_ and d.iloc[0] < 0.05:
+                        iguais = list(d[d < d.iloc[0] + 0.01].index)
+                        # 1) series economicamente iguais (programas pulverizados): mesmo pago/VNA todo mes
+                        taxa_pg = np.array([[(lambda a: a[1] / a[0] if a[0] else np.nan)(self.ancora(s_, x.mes[i], pu[i])) for i in ii
+                                             if np.isfinite(pu[i])] for s_ in iguais], float)
+                        ok_ = np.isfinite(taxa_pg).any() and np.nanmax(np.nanmax(taxa_pg, 0) - np.nanmin(taxa_pg, 0)) < 0.003
+                        if not ok_:                    # 2) series irmas: o retorno oficial ao par (o fluxo) e o mesmo mes a mes
+                            viz = d[d < min(0.05, d.iloc[0] + 0.02)].index
+                            rp = np.array([self.erro_trajeto(s_, x.mes[ii].values, pu[ii].values, par=True) for s_ in viz], float)
+                            ok_ = rp.shape[1] > 0 and np.isfinite(rp).all(0).sum() >= 2 and np.nanmax(np.nanmax(rp, 0) - np.nanmin(rp, 0)) < 0.002
+                    self.motivo.update(dict.fromkeys(ii, d.iloc[:4].round(4).to_dict()))
+                    cands = [d.index[0]] if ok_ else []
+                if len(cands) == 1:
+                    for i in ii:
+                        out[i] = cands[0]
+        return out
+
+    def erro_trajeto(self, serie, meses, pus, par=False):
+        """Erro mediano entre o retorno mensal do PU do fundo e o da serie ao par (VNA + pago) nos meses seguidos;
+        par=True devolve o retorno ao par de cada mes seguido (NaN quando falta a serie no mes)."""
+        o = np.argsort(meses)
+        meses, pus = np.asarray(meses)[o], np.asarray(pus, float)[o]
+        er = []
+        for j in range(1, len(meses)):
+            if meses[j - 1] != (pd.Period(meses[j]) - 1).strftime("%Y-%m") or not (pus[j] > 0 and pus[j - 1] > 0):
+                continue
+            v1, pg, _ = self.ancora(serie, meses[j], pus[j])
+            v0 = self.ancora(serie, meses[j - 1], pus[j - 1])[0]
+            ok = np.isfinite(v1) and np.isfinite(v0) and v0 > 0
+            er.append(((v1 + pg) / v0 - 1 if ok else np.nan) if par else abs((pus[j] + pg) / pus[j - 1] - (v1 + pg) / v0) if ok else np.nan)
+        if par:
+            return er
+        er = [e_ for e_ in er if np.isfinite(e_)]
+        return float(np.median(er)) if er else np.inf
+
+    def ancora(self, serie, m, pu):
+        """(VNA, pago) da serie no mes na leitura que bate com o PU informado pelo fundo: cada securitizadora preenche o
+        informe de um jeito (valor total da serie ou por certificado; pagamento total ou por certificado). Devolve tambem a
+        distancia |PU/VNA - 1|; sem leitura a menos de 25% do PU -> NaN (serie nao usada no mes)."""
+        try:
+            V, Q, P, vna_c, pago_c = self.sec_m.loc[(serie, m)]
+        except KeyError:
+            return np.nan, np.nan, np.inf
+        if not (np.isfinite(pu) and pu > 0 and Q > 0):
+            return vna_c, pago_c, (abs(pu / vna_c - 1) if np.isfinite(pu) and vna_c > 0 else np.inf)
+        cands = [(V / Q, P / Q), (V, P / Q), (V / Q, P), (V, P)]
+        dist = [abs(pu / v - 1) if v > 0 else np.inf for v, _ in cands]
+        k = int(np.argmin(dist))
+        v, pg = cands[k]
+        if pg > 0.6 * v:                                 # pagamento maior que 60% do valor: a outra escala do pagamento
+            pg = P / Q if pg == P else P
+        return (v, pg, dist[k]) if dist[k] < 0.25 else (np.nan, np.nan, dist[k])
+
+    def pago_securit(self, series, m, pu1, pu0):
+        """(pago por certificado no mes, VNA do mes, VNA do mes anterior) de cada serie, na escala do PU do fundo."""
+        p = (pd.Timestamp(m) - pd.DateOffset(months=1)).strftime("%Y-%m")
+        a = [self.ancora(s_, m, u) for s_, u in zip(series, pu1)]
+        b = [self.ancora(s_, p, u) for s_, u in zip(series, pu0)]
+        v1, v0 = np.array([x[0] for x in a], float), np.array([x[0] for x in b], float)
+        pg = np.array([x[1] for x in a], float)
+        for j, s_ in enumerate(series):                 # escala do pagamento (total ou por certificado): a que da o retorno ao par mais normal
+            try:
+                _, Q, P, _, _ = self.sec_m.loc[(s_, m)]
+            except KeyError:
+                continue
+            if np.isfinite(v0[j]) and v0[j] > 0 and Q > 0 and np.isfinite(P):
+                pg[j] = min((P, P / Q), key=lambda g: abs((v1[j] + g) / v0[j] - 1.01))
+        return pg, v1, v0
 
     def pagto_snd(self, cods, p, m, pu_ant):
         """Debenture do SND: o que foi pago no mes por unidade (amortizacao + juros) = PU par do mes anterior corrigido
@@ -1629,6 +1854,11 @@ def detalhe(nome, cnpj, df, ctx, pl, rent):
     tick = df.ativo.fillna("").str.strip()
     df["codigo"] = df.codigo.where(df.codigo.notna(), tick.where(tick.str.fullmatch(r"[A-Z]{4}[A-Z0-9]{1,4}")))
     df["casa"] = casa(df, ctx)
+    sec_ = df.casa.isin(["CRI", "CRA"])                 # CRI/CRA: serie do informe da securitizadora (CVM) vira o codigo do ativo
+    df["serie"] = None
+    if sec_.any():
+        df.loc[sec_, "serie"] = ctx.serie_securit(df[sec_]).values
+        df["codigo"] = df.codigo.where(df.serie.isna(), df.serie)
     df["venc"] = vencimento(df)
     df["tp"] = tipo_tp(df)
     df["rotulo"] = rotulo(df, df.venc.fillna(df.codigo.map(ctx.snd.venc) if len(ctx.snd) else df.venc), df.tp)
@@ -1736,6 +1966,20 @@ def detalhe(nome, cnpj, df, ctx, pl, rent):
         r = r.mask(perda, rp)
         src[perda] = "preço do fundo (perda que persiste)"
         exp_ = esperado.values
+        sc = w.serie.notna().values if "serie" in w else np.zeros(len(w), bool)
+        if sc.any():                                    # CRI/CRA casados: (preco + pago por certificado) / preco anterior - 1
+            pg, v1, v0 = ctx.pago_securit(w.serie.values[sc], m, pu1[sc], pu0[sc])
+            rs = (pu1[sc] + pg) / pu0[sc] - 1
+            ofi = (v1 + pg) / v0 - 1                    # retorno oficial da serie (ao par) quando falta o preco do fundo
+            parado = np.isclose(pu1[sc], pu0[sc], rtol=1e-6)     # PU do fundo nao atualizado no mes: vale o par oficial
+            sem_pg = (v1 / v0 - 1 < -0.01) & ~(pg > 0.001 * v0)  # VNA caiu sem pagamento informado: fluxo incompleto, fica a regra do carrego
+            okp = np.isfinite(rs) & (rs > -0.25) & (rs < 0.3) & ~parado & ~sem_pg
+            oko = ~okp & ~sem_pg & np.isfinite(ofi) & (ofi > -0.5) & (ofi < 0.3)
+            rr, ss = np.asarray(r, float).copy(), src.copy()
+            ix = np.flatnonzero(sc)
+            rr[ix[okp]], ss[ix[okp]] = rs[okp], "preço + pagamento (securitizadora, CVM)"
+            rr[ix[oko]], ss[ix[oko]] = ofi[oko], "série oficial ao par (securitizadora, CVM)"
+            r, src = pd.Series(rr, index=w.index), ss
         deb = w.casa.isin(["DEB", "DEBIN"]).values
         if deb.any():
             pag = np.full(len(w), np.nan)
@@ -1926,7 +2170,7 @@ LIMITE_CONF = 5.0                          # % do PL confidencial acima do qual 
 MESES_ATIVOS = 3                           # meses abertos com a lista de ativos no HTML (por fundo)
 FORA_PERF = {"Caixa", "Títulos Públicos", "Ajuste", "Confidencial", "Taxas do fundo", lt.AJUSTE}
 N_DETALHE = 1800                           # ativos com historico completo no HTML (clique)
-SRC = {"preço + pagamento (SND)": "S", "preço do fundo": "P", "carrego + curva (sem preço)": "E", "FIDC: rentabilidade oficial (CVM)": "F",
+SRC = {"preço + pagamento (securitizadora, CVM)": "Q", "série oficial ao par (securitizadora, CVM)": "O", "preço + pagamento (SND)": "S", "preço do fundo": "P", "carrego + curva (sem preço)": "E", "FIDC: rentabilidade oficial (CVM)": "F",
        "Tesouro + cupom": "T", "preço em R$": "U", "preço de mercado": "M", "preço do fundo (perda que persiste)": "L", "CDI": "C"}
 
 
@@ -2259,7 +2503,7 @@ function geral(){const b=$("#g_busca").value.toLowerCase();
     marker:{color:n?"#eb6834":"#9aa0a6",size:n?12:9,line:{color:"#fff",width:1}},hovertemplate:"%{text}<br>CDI+ %{y:.2f}%<br>duration %{x:.2f}<extra></extra>"}}),LAY({xaxis:{title:{text:"duration (anos)"}},yaxis:{title:{text:"spread CDI+ (% a.a.)"}}}))}
 // ---------- detalhe de um ativo (clique em qualquer tabela de ativos)
 let detN=0;
-const FONTE={S:"preço do fundo + juros/amortização pagos (PU par do SND)",P:"preço informado pelo fundo",E:"carrego + curva (sem preço observável no mês)",
+const FONTE={Q:"preço do fundo + juros/amortização pagos (informe da securitizadora, CVM)",O:"retorno oficial da série ao par (informe da securitizadora, CVM)",S:"preço do fundo + juros/amortização pagos (PU par do SND)",P:"preço informado pelo fundo",E:"carrego + curva (sem preço observável no mês)",
  F:"FIDC: rentabilidade oficial da série (CVM)",T:"Tesouro + cupom",U:"preço em R$ (sem hedge)",M:"preço de mercado",C:"CDI",
  A:"carrego (CDI + spread): o preço caiu forte — amortização ou perda? o fluxo deste papel não é público, confira"};
 function detalheAtivo(tr,ch,ncol,ctx){const prox=tr.nextElementSibling;if(prox&&prox.classList.contains("det")){prox.remove();return}
@@ -2301,7 +2545,8 @@ function detalheAtivo(tr,ch,ncol,ctx){const prox=tr.nextElementSibling;if(prox&&
   else $("#"+id+"e").innerHTML=`<div class="mini">Sem marcação ANBIMA para este ativo: de graça a ANBIMA só publica debêntures (CRI/CRA, LF, CDB, FIDC e NC não têm arquivo público). Histórico desde ${diaBR(D.anb_ini)}, cresce a cada atualização.</div>`;
   $("#"+id+"f").innerHTML=`<b>Como o retorno do ativo é medido</b><br>Retorno total do mês, comparável ao CDI: preço + juros/amortização pagos, sem hedge nem resíduo do fundo.<br>`+
    `• Debêntures: preço do fundo + o que foi pago no mês (queda do PU par do SND).<br>• FIDC: rentabilidade oficial da série (CVM).<br>• LF/LFSN/CDB: preço (não pagam no meio).<br>`+
-   `• CRI/CRA/NC/CCB: pagam todo mês e o fluxo não é público; preço abaixo do esperado = pagamento → fica carrego + curva. Queda grande que não volta pode ser amortização ou perda: fica o carrego e a barra fica amarela para conferir.<br>`+
+   `• CRI/CRA: preço do fundo + juros/amortização pagos no mês pelo informe mensal da securitizadora (CVM), casando a série por ISIN/código ou devedor + vencimento.<br>`+
+   `• CRI/CRA sem série casada, NC e CCB (fluxo não público): preço abaixo do esperado = pagamento → carrego + curva; queda forte que não volta fica amarela para conferir.<br>`+
    `Este ativo: ${idx.length} meses, ${idx.length-est} com preço observado e ${est} estimados (barra azul clara)${nev?` • <b style="color:#b26b00">${nev} mês(es) com queda forte de preço (barra amarela)</b>`:""}.`}
 // ---------- fundo
 $("#f_sel").innerHTML=[...D.fundos].sort((a,b)=>(b.nosso-a.nosso)||a.nome.localeCompare(b.nome)).map(f=>`<option value="${f.id}">${f.nosso?"★ ":""}${esc(f.nome)}</option>`).join("");
