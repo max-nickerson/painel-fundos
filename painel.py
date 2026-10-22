@@ -2194,10 +2194,17 @@ def _r(x, n=2):
     return round(x, n) if math.isfinite(x) else None
 
 
+_COD_OK = re.compile(r"^([A-Z]{4}[0-9A-Z]{1,2}|[A-Z]{2}[A-Z0-9]{9}[0-9]|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{2}[A-L]\d{7}|"
+                     r"(CRA|CRI|LF|LFS[CN]|NC|CDB|LIG|CDCA)[0-9A-Z]{6,12}|[A-Z0-9]{4}\d{1,2}[A-Z0-9]{0,4})$")
+
+
 def _chave(codigo, rotulo):
-    """Mesmo ativo em fundos diferentes: codigo (debenture/CRI/ISIN/CNPJ de fundo) ou, sem codigo, o rotulo."""
-    c = str(codigo or "").strip()
-    return c.upper() if c and c.lower() not in ("none", "nan") else re.sub(r"\s+", " ", str(rotulo)).upper().strip()
+    """Mesmo ativo em fundos diferentes: codigo (debenture, ação, ISIN, CNPJ de fundo, codigo CETIP) ou, sem codigo valido, o rotulo.
+    Codigos genericos da CVM ("82", "83", "99", "999", numero interno do fundo) juntavam ativos diferentes: viram rotulo."""
+    c = str(codigo or "").strip().upper()
+    if c and c.lower() not in ("none", "nan") and _COD_OK.match(c) and not c.isdigit():
+        return c
+    return re.sub(r"\s+", " ", str(rotulo)).upper().strip()
 
 
 def _ret_mensal(datas, serie):
@@ -2219,6 +2226,8 @@ def _metricas(r, cdi):
     vol = np.std(r[ok], ddof=1) * np.sqrt(12) if n >= 6 else np.nan
     ex = r[ok] - cdi[ok]
     sh = ex.mean() / np.std(r[ok], ddof=1) * np.sqrt(12) if n >= 6 and np.std(r[ok], ddof=1) > 1e-9 else np.nan
+    if vol == vol and vol < 1:                       # marcado na curva: vol ~0 faz o Sharpe explodir (ex.: LF subordinada)
+        sh = np.nan
     return [_r(a), _r(a / c * 100 if c > 0 else np.nan, 0), _r(vol), _r(sh), n]
 
 
@@ -2282,6 +2291,14 @@ def exporta_html(pasta=None, saida=None, log=print):
     ult = {f["id"]: f["abertos"][-1] for f in fundos if f["abertos"]}
     pls_mes = {(f["id"], c["m"]): c["pl"] for f in fundos for c in f["carteira"]}
     P = pd.concat(pos, ignore_index=True) if pos else pd.DataFrame(columns=["id", "mes", "chave", "rotulo", "categoria", "grupo", "emissor", "perc"])
+    # fundo que nao informa o codigo: se o rotulo so aparece com um codigo nos outros fundos, e o mesmo ativo
+    rk = lambda r: re.sub(r"\s+", " ", str(r)).upper().strip()
+    pares = pd.DataFrame([(rk(c[2]), c[1]) for c in contrib] + list(zip(P.rotulo.map(rk), P.chave)), columns=["rk", "ch"]).drop_duplicates()
+    pares = pares[pares.rk != pares.ch]
+    uni = pares.groupby("rk").ch.agg(lambda x: x.iloc[0] if len(x) == 1 else None).dropna().to_dict()
+    P["chave"] = [uni.get(c, c) for c in P.chave]
+    contrib = [c[:1] + (uni.get(c[1], c[1]),) + c[2:] for c in contrib]
+    ativos = [x[:2] + [uni.get(x[2], x[2])] + x[3:] for x in ativos]
     P = P.groupby(["id", "mes", "chave"], as_index=False).agg(rotulo=("rotulo", "first"), categoria=("categoria", "first"),
                                                               grupo=("grupo", "first"), emissor=("emissor", "first"), perc=("perc", "sum"),
                                                               pct_par=("pct_par", "median"), spread=("spread", "median"), duration=("duration", "median"),
@@ -2292,6 +2309,7 @@ def exporta_html(pasta=None, saida=None, log=print):
     P.loc[cr, "pct_par"] = [(pu / v * 100 if np.isfinite(v) and v > 0 else np.nan) for pu, v in
                             zip(P.pu[cr], [sec.ancora(c, m, pu)[0] for c, m, pu in zip(P.chave[cr], P.mes[cr], P.pu[cr])])]
     P["pct_par"] = P.pct_par.where(P.pct_par.between(30, 130))
+    P["spread"] = P.spread.mask(P.categoria.isin(["FIDC", "FIAGRO"]) & (P.spread < -3))     # FIDC: é perda realizada, não spread
     di_ = P.chave.map(lt.snd_caracteristicas().indice).eq("DI") | P.ind.eq("DI")
     P["pct_par"] = P.pct_par.mask(di_ & (P.pct_par > 104))
     alto = di_ & ((P.pct_par.between(95, 105) & (P.taxa > 12)) | (P.pct_par.isna() & (P.taxa > 20)))   # CDI+12 ao par / CDI+20 sem preco: taxa mal lida
@@ -2322,6 +2340,34 @@ def exporta_html(pasta=None, saida=None, log=print):
     cdi_v = np.array([cdi_m[m] * 100 for m in meses])
     C = pd.DataFrame(contrib, columns=["id", "chave", "rotulo", "categoria", "grupo", "emissor", "mes", "v", "p", "r", "src"])
     C = C[C.mes.isin(mi) & (C.p > 0.01) & C.r.notna() & (C.mes <= C.id.map(ult).fillna(""))]
+    # cesta sem codigo (ex.: "Ações Tesouro Nacional" mistura LFT/NTN-B/LTN): PU pula mes a mes, retorno nao e de um ativo
+    sc = P[P.chave.eq(P.rotulo.astype(str).str.replace(r"\s+", " ", regex=True).str.upper().str.strip()) & P.pu.gt(0)].sort_values("mes")
+    salto = (sc.pu / sc.groupby(["id", "chave"]).pu.shift()).pipe(lambda q: (q > 2) | (q < .5))
+    n_salto = salto.groupby([sc.id, sc.chave]).sum()                  # 2+ saltos: nao e uma amortizacao grande, e cesta
+    cesta = {c for (i, c), n in n_salto.items() if n >= 2 and not _COD_OK.match(c)} - set(sc.chave[sc.categoria.isin(["FIDC", "FIAGRO", "Fundos"])])
+    C = C[~C.chave.isin(cesta)]
+    # acao com PU que nao e preco (ex.: fundo passa a informar ~1,0 para todas as acoes): compara com o PU dos outros fundos no mes
+    # (ou o ultimo dos 3 meses anteriores); fora de 0,6–1,6x, o mes e o seguinte nao entram no retorno do ativo
+    ac = P[P.categoria.eq("Ações") & P.pu.gt(0) & P.chave.str.match(r"^[A-Z]{4}\d{1,2}$")][["id", "mes", "chave", "pu"]]
+    if len(ac):
+        tot = ac.groupby(["chave", "mes"]).pu.agg(["sum", "count"])
+        ac = ac.join(tot, on=["chave", "mes"])
+        ac["ref"] = ((ac["sum"] - ac.pu) / (ac["count"] - 1)).where(ac["count"] > 1)
+        cad = ac.groupby(["chave", "mes"]).pu.median().reset_index().sort_values("mes")
+        cad["ant"] = cad.groupby("chave").pu.shift()
+        cad["m_ant"] = cad.groupby("chave").mes.shift()
+        ac = ac.merge(cad[["chave", "mes", "ant", "m_ant"]], on=["chave", "mes"], how="left")
+        perto = [isinstance(m0, str) and (pd.Period(m) - pd.Period(m0)).n <= 3 for m, m0 in zip(ac.mes, ac.m_ant)]
+        ac["ref"] = ac.ref.fillna(ac.ant.where(perto))
+        cad["prox"] = cad.groupby("chave").pu.shift(-1)
+        q0, q1 = cad.pu / cad.ant, cad.prox / cad.ant
+        pico = cad[((q0 < .6) | (q0 > 1.6)) & q1.between(.8, 1.25)]                  # mes que salta e volta: preco errado em todos os fundos
+        q = ac.pu / ac.ref
+        mal = pd.concat([ac[(q < .6) | (q > 1.6)], ac.merge(pico[["chave", "mes"]], on=["chave", "mes"])])
+        ruim = set(zip(mal.id, mal.mes, mal.chave)) | {(i, (pd.Period(m) + 1).strftime("%Y-%m"), c) for i, m, c in zip(mal.id, mal.mes, mal.chave)}
+        ruim_t = {(c, m) for c, m in zip(pico.chave, pico.mes)} | {(c, (pd.Period(m) + 1).strftime("%Y-%m")) for c, m in zip(pico.chave, pico.mes)}
+        C = C[[(i, m, c) not in ruim and (c, m) not in ruim_t for i, m, c in zip(C.id, C.mes, C.chave)]]
+        log(f"   ações com PU fora do mercado: {len(mal)} posições fora do retorno")
     tem = set(zip(P.id, P.mes, P.chave))
     ant = {m: (pd.Period(m) - 1).strftime("%Y-%m") for m in C.mes.unique()}
     C["oculto"] = [(i, m) in escondido and (i, ant[m], c) not in tem for i, m, c in zip(C.id, C.mes, C.chave)]
@@ -2370,6 +2416,10 @@ def exporta_html(pasta=None, saida=None, log=print):
                      "duration": _r(u.duration) if u is not None else None, "temos": ch in temos})
         series[ch] = r
     perf.sort(key=lambda x: -(x["n_ever"] * (x["wt"][4] or 0)))
+    rep_ = pd.Series([x["rotulo"] for x in perf]).value_counts()
+    for x in perf:                                     # rotulo igual para ativos diferentes (series de CRA): poe o codigo
+        if rep_.get(x["rotulo"], 0) > 1 and x["chave"] != re.sub(r"\s+", " ", str(x["rotulo"])).upper().strip():
+            x["rotulo"] = f'{x["rotulo"]} ({x["chave"]})'
     det_ch = ({a[2] for a in ativos} | {p["chave"] for p in perf[:N_DETALHE]}       # todo ativo de carteira aberta + os mais relevantes
               | {o["chave"] for o in sorted(overlap, key=lambda o: -o["n"])[:500]})
     # historico do clique: retorno mensal, % PL em cada fundo, spread e PU informados pelos fundos, ANBIMA, ultimos negocios B3
@@ -2411,8 +2461,9 @@ def exporta_html(pasta=None, saida=None, log=print):
         g = g.assign(r=g.r.fillna(g.chave.map(lambda c: np.nan)).fillna(g.mes.map(lambda m: ((1 + cdi_m.get(m, 0)) * 1.02 ** (1 / 12) - 1) * 100)))
         rr = g.groupby("chave").r.apply(lambda s: (np.prod(1 + (s / 100).clip(-.6, .6)) - 1) * 100)      # retorno total do ativo, 12m
         x = x.join(rr.rename("ret"))
-        x = x.loc[x.v.abs().sort_values(ascending=False).index[:60].union(x.ret.sort_values(ascending=False).index[:40])]
-        f_top[fid] = [[ch, r.rotulo, r.categoria, _r(r.ret), _r(r.v * 100, 1), _r(r.p), int(r.n)] for ch, r in x.iterrows()]
+        x = x.join((g.p * g.r).groupby(g.chave).sum().rename("bps_ativo"))       # peso (% PL) x retorno (%) = bps, mesma base do retorno
+        x = x.loc[x.bps_ativo.abs().sort_values(ascending=False).index[:60].union(x.ret.sort_values(ascending=False).index[:40])]
+        f_top[fid] = [[ch, r.rotulo, r.categoria, _r(r.ret), _r(r.bps_ativo, 1), _r(r.p), int(r.n), _r(r.v * 100, 1)] for ch, r in x.iterrows()]
     dados = {"gerado": pd.Timestamp.now().strftime("%d/%m/%Y %H:%M"), "cdi": {k: _r(v * 100, 3) for k, v in cdi_m.items()},
              "ult_mes_completo": ult_completo, "meses": meses, "fundos": fundos, "ativos": ativos, "overlap": overlap, "grupos": grupos,
              "perf": perf, "det": det, "f_top": f_top, "limite_conf": LIMITE_CONF, "anb_ini": min((v["d"][0] for v in anb.values()), default=None),
@@ -2485,7 +2536,7 @@ details.ms label{display:block;padding:2px 0;white-space:nowrap}.mini{font-size:
   <div class="cx"><h2>Spread CDI+ e duration da carteira</h2><div class="ctl"><details class="ms" id="f_sdcat"><summary>Categorias ▾</summary><div class="op"></div></details></div><div id="f_sd" style="height:360px"></div></div>
   <div class="cx"><h2>Retorno mensal × CDI e de onde veio (por categoria)</h2><div id="f_ret" style="height:380px"></div></div>
   <div class="cx"><h2>Carteira</h2><div class="ctl"><select id="f_mes"></select><select id="f_cat"></select><input id="f_busca" placeholder="buscar ativo/emissor"></div><div class="scroll"><table class="t" id="f_tab"></table></div></div>
-  <div class="cx"><h2>Melhores ativos do fundo — últimos 12 meses</h2><div class="ctl"><span class="chip on" data-m="ret">Retorno do ativo</span><span class="chip" data-m="bps">Contribuição para o fundo (bps)</span><select id="f_topcat"></select></div><div class="scroll"><table class="t" id="f_top"></table></div></div>
+  <div class="cx"><h2>Melhores ativos do fundo — últimos 12 meses</h2><div class="ctl"><span class="chip on" data-m="ret">Retorno do ativo</span><span class="chip" data-m="bps">Contribuição para o fundo (bps)</span><span class="sub" style="margin-left:6px">contribuição do ativo = peso × retorno (mesma base do retorno); "com hedge e resíduo" soma os hedges e o resíduo alocados</span><select id="f_topcat"></select></div><div class="scroll"><table class="t" id="f_top"></table></div></div>
   <div class="cx"><h2>Mudanças na carteira</h2><div class="sub" id="f_mud_sub"></div><div class="g2"><div class="bx"><b class="tt">Entradas e aumentos</b><table class="t" id="f_mud_up"></table></div><div class="bx"><b class="tt">Saídas e reduções</b><table class="t" id="f_mud_dn"></table></div></div></div>
 </section>
 <section class="aba" id="a_perf">
@@ -2670,9 +2721,9 @@ function tabFundo(){const f=F[$("#f_sel").value],m=$("#f_mes").value,b=$("#f_bus
 function topFundo(){const f=F[$("#f_sel").value],todos=D.f_top[f.id]||[],cats=[...new Set(todos.map(a=>a[2]))].sort();
   if($("#f_topcat").dataset.f!=f.id){$("#f_topcat").innerHTML='<option value="">todas as categorias</option>'+cats.map(c=>`<option>${esc(c)}</option>`).join("");$("#f_topcat").dataset.f=f.id}
   const c=$("#f_topcat").value;
-  const L=ordena(todos.filter(a=>!c||a[2]==c).map(a=>({ch:a[0],ativo:a[1],cat:a[2],ret:a[3],bps:a[4],perc:a[5],n:a[6]})),tOrd).slice(0,40);
-  const C=[["ativo","Ativo","l"],["cat","Categoria","l"],["ret","Retorno 12m"],["bps","Contribuição (bps)"],["perc","% PL médio"],["n","Meses na carteira"]];
-  $("#f_top").innerHTML=th(C,tOrd)+L.map(a=>`<tr class="cl" data-ch="${esc(a.ch)}"><td class="l">${esc(a.ativo)}</td><td class="l"><span class="ponto" style="background:${corCat(a.cat)}"></span>${esc(a.cat)}</td><td class="${cls(a.ret)}">${a.ret==null?"—":br(a.ret)+"%"}</td><td class="${cls(a.bps)}">${br(a.bps,1)}</td><td>${br(a.perc)}</td><td>${a.n}</td></tr>`).join("");
+  const L=ordena(todos.filter(a=>!c||a[2]==c).map(a=>({ch:a[0],ativo:a[1],cat:a[2],ret:a[3],bps:a[4],perc:a[5],n:a[6],bpsh:a[7]})),tOrd).slice(0,40);
+  const C=[["ativo","Ativo","l"],["cat","Categoria","l"],["ret","Retorno 12m"],["bps","Contribuição do ativo (bps)"],["bpsh","Com hedge e resíduo (bps)"],["perc","% PL médio"],["n","Meses na carteira"]];
+  $("#f_top").innerHTML=th(C,tOrd)+L.map(a=>`<tr class="cl" data-ch="${esc(a.ch)}"><td class="l">${esc(a.ativo)}</td><td class="l"><span class="ponto" style="background:${corCat(a.cat)}"></span>${esc(a.cat)}</td><td class="${cls(a.ret)}">${a.ret==null?"—":br(a.ret)+"%"}</td><td class="${cls(a.bps)}">${br(a.bps,1)}</td><td class="${cls(a.bpsh)} mut" title="inclui hedges (ex.: câmbio de bonds) e o resíduo do fundo distribuídos pelo peso">${br(a.bpsh,1)}</td><td>${br(a.perc)}</td><td>${a.n}</td></tr>`).join("");
   cabec($("#f_top"),C,tOrd,()=>{document.querySelectorAll("#a_fundo .chip[data-m]").forEach(x=>x.classList.toggle("on",x.dataset.m==tOrd.k));topFundo()});
   $("#f_top").querySelectorAll("tr.cl").forEach(t=>t.onclick=()=>detalheAtivo(t,t.dataset.ch,C.length,f.id))}
 function mudancas(){const f=F[$("#f_sel").value],ms=[...new Set(D.ativos.filter(a=>a[0]==f.id).map(a=>a[1]))].sort();
